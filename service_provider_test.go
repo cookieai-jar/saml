@@ -369,7 +369,7 @@ func TestSPCanProducePostLogoutRequest(t *testing.T) {
 	err := xml.Unmarshal(test.IDPMetadata, &s.IDPMetadata)
 	assert.Check(t, err)
 
-	form, err := s.MakePostLogoutRequest("ros@octolabs.io", "relayState")
+	form, err := s.MakePostLogoutRequest("ros@octolabs.io", "relayState", "")
 	assert.Check(t, err)
 	golden.Assert(t, string(form), t.Name()+"_form")
 }
@@ -391,7 +391,7 @@ func TestSPCanProduceRedirectLogoutRequest(t *testing.T) {
 	err := xml.Unmarshal(test.IDPMetadata, &s.IDPMetadata)
 	assert.Check(t, err)
 
-	redirectURL, err := s.MakeRedirectLogoutRequest("ross@octolabs.io", "relayState")
+	redirectURL, err := s.MakeRedirectLogoutRequest("ross@octolabs.io", "relayState", "")
 	assert.Check(t, err)
 
 	decodedRequest, err := testsaml.ParseRedirectRequest(redirectURL)
