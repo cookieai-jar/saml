@@ -46,6 +46,8 @@ type Middleware struct {
 	ResponseBinding string // either saml.HTTPPostBinding or saml.HTTPArtifactBinding
 	RequestTracker  RequestTracker
 	Session         SessionProvider
+
+	CreateIdpInitializedRedirectURI func(relayState string) string
 }
 
 // ServeHTTP implements http.Handler and serves the SAML-specific HTTP endpoints
@@ -197,8 +199,10 @@ func (m *Middleware) CreateSessionFromAssertion(w http.ResponseWriter, r *http.R
 		trackedRequest, err := m.RequestTracker.GetTrackedRequest(r, trackedRequestIndex)
 		if err != nil {
 			if err == http.ErrNoCookie && m.ServiceProvider.AllowIDPInitiated {
-				if uri := r.Form.Get("RelayState"); uri != "" {
-					redirectURI = uri
+				// Original library uses the RelayState in a non-standard way. Google passes it as URL.
+				// Other IDPs may or not may use an IDP.
+				if relayState := r.Form.Get("RelayState"); relayState != "" {
+					redirectURI = m.CreateIdpInitializedRedirectURI(relayState)
 				}
 			} else {
 				m.OnError(w, r, err)
