@@ -123,6 +123,8 @@ type ServiceProvider struct {
 	// LogoutBindings specify the bindings available for SLO endpoint. If empty,
 	// HTTP-POST binding is used.
 	LogoutBindings []string
+
+	AllowNoSignatureLogout bool
 }
 
 // MaxIssueDelay is the longest allowed time between when a SAML assertion is
@@ -1542,23 +1544,26 @@ func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData str
 
 	gr, err := io.ReadAll(newSaferFlateReader(bytes.NewBuffer(rawResponseBuf)))
 	if err != nil {
-		retErr.PrivateErr = err
+		retErr.PrivateErr = fmt.Errorf("unable to deflate: %s", err)
 		return retErr
 	}
+	retErr.Response = string(gr)
 
 	if err := xrv.Validate(bytes.NewReader(gr)); err != nil {
 		return err
 	}
 
 	doc := etree.NewDocument()
-	if err := doc.ReadFromBytes(rawResponseBuf); err != nil {
+	if err := doc.ReadFromBytes(gr); err != nil {
 		retErr.PrivateErr = err
 		return retErr
 	}
 
 	if err := sp.validateSignature(doc.Root()); err != nil {
-		retErr.PrivateErr = err
-		return retErr
+		if !sp.AllowNoSignatureLogout {
+			retErr.PrivateErr = err
+			return retErr
+		}
 	}
 
 	var resp LogoutResponse
