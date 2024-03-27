@@ -99,6 +99,7 @@ func TestMiddlewareIdpInitializedRelayState(t *testing.T) {
 		test.Middleware.ServeHTTP(resp, req)
 		assert.Check(t, is.Equal(http.StatusFound, resp.Code))
 
+		// Location is being tested
 		assert.Check(t, is.Equal("https://www.google.com/", resp.Header().Get("Location")))
 		assert.Check(t, is.DeepEqual([]string{
 			"ttt=" + test.expectedSessionCookie + "; " +
@@ -122,6 +123,7 @@ func TestMiddlewareIdpInitializedRelayState(t *testing.T) {
 		test.Middleware.ServeHTTP(resp, req)
 		assert.Check(t, is.Equal(http.StatusFound, resp.Code))
 
+		// Location is being tested
 		assert.Check(t, is.Equal("/", resp.Header().Get("Location")))
 		assert.Check(t, is.DeepEqual([]string{
 			"ttt=" + test.expectedSessionCookie + "; " +
