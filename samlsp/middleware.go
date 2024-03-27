@@ -200,7 +200,7 @@ func (m *Middleware) CreateSessionFromAssertion(w http.ResponseWriter, r *http.R
 		if err != nil {
 			if err == http.ErrNoCookie && m.ServiceProvider.AllowIDPInitiated {
 				// Original library uses the RelayState in a non-standard way. Google passes it as URL.
-				// Other IDPs may or not may use an IDP.
+				// Other IDPs may or not may use it differently.
 				if relayState := r.Form.Get("RelayState"); relayState != "" {
 					redirectURI = m.CreateIdpInitializedRedirectURI(relayState)
 				}
