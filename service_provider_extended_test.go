@@ -16,7 +16,6 @@ import (
 func TestValidateLogoutResponseRedirect(t *testing.T) {
 	test := NewServiceProviderTest(t)
 	TimeNow = func() time.Time {
-		//rv, _ := time.Parse("Mon Jan 2 15:04:05.999999999 UTC 2006", "Mon Dec 1 01:31:21.123456789 UTC 2015")
 		return time.Now()
 	}
 	Clock = dsig.NewFakeClockAt(TimeNow())
