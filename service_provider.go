@@ -1197,8 +1197,7 @@ func (sp *ServiceProvider) SignLogoutRequest(req *LogoutRequest) error {
 }
 
 // MakeLogoutRequest produces a new LogoutRequest object for idpURL.
-func (sp *ServiceProvider) MakeLogoutRequest(idpURL, nameID string) (*LogoutRequest, error) {
-
+func (sp *ServiceProvider) MakeLogoutRequest(idpURL, nameID, sessionID string) (*LogoutRequest, error) {
 	req := LogoutRequest{
 		ID:           fmt.Sprintf("id-%x", randomBytes(20)),
 		IssueInstant: TimeNow(),
@@ -1215,6 +1214,9 @@ func (sp *ServiceProvider) MakeLogoutRequest(idpURL, nameID string) (*LogoutRequ
 			SPNameQualifier: sp.Metadata().EntityID,
 		},
 	}
+	if sessionID != "" {
+		req.SessionIndex = &SessionIndex{Value: sessionID}
+	}
 	if len(sp.SignatureMethod) > 0 {
 		if err := sp.SignLogoutRequest(&req); err != nil {
 			return nil, err
@@ -1226,16 +1228,19 @@ func (sp *ServiceProvider) MakeLogoutRequest(idpURL, nameID string) (*LogoutRequ
 // MakeRedirectLogoutRequest creates a SAML authentication request using
 // the HTTP-Redirect binding. It returns a URL that we will redirect the user to
 // in order to start the auth process.
-func (sp *ServiceProvider) MakeRedirectLogoutRequest(nameID, relayState string) (*url.URL, error) {
-	req, err := sp.MakeLogoutRequest(sp.GetSLOBindingLocation(HTTPRedirectBinding), nameID)
+func (sp *ServiceProvider) MakeRedirectLogoutRequest(nameID, relayState, sessionID string) (*url.URL, error) {
+	req, err := sp.MakeLogoutRequest(sp.GetSLOBindingLocation(HTTPRedirectBinding), nameID, sessionID)
 	if err != nil {
 		return nil, err
 	}
-	return req.Redirect(relayState), nil
+	return req.Redirect(sp, relayState)
 }
 
 // Redirect returns a URL suitable for using the redirect binding with the request
-func (r *LogoutRequest) Redirect(relayState string) *url.URL {
+//
+// SAML library does not sign the logout requests correctly. This is a variation of AuthnRequest Redirect.
+// See https://github.com/crewjam/saml/issues/550
+func (r *LogoutRequest) Redirect(sp *ServiceProvider, relayState string) (*url.URL, error) {
 	w := &bytes.Buffer{}
 	w1 := base64.NewEncoder(base64.StdEncoding, w)
 	w2, _ := flate.NewWriter(w1, 9)
@@ -1253,21 +1258,42 @@ func (r *LogoutRequest) Redirect(relayState string) *url.URL {
 
 	rv, _ := url.Parse(r.Destination)
 
-	query := rv.Query()
-	query.Set("SAMLRequest", w.String())
-	if relayState != "" {
-		query.Set("RelayState", relayState)
+	query := rv.RawQuery
+	if len(query) > 0 {
+		query += "&SAMLRequest=" + url.QueryEscape(w.String())
+	} else {
+		query += "SAMLRequest=" + url.QueryEscape(w.String())
 	}
-	rv.RawQuery = query.Encode()
 
-	return rv
+	if relayState != "" {
+		query += "&RelayState=" + relayState
+	}
+
+	// No relay state used
+	if len(sp.SignatureMethod) > 0 {
+		query += "&SigAlg=" + url.QueryEscape(sp.SignatureMethod)
+		signingContext, err := GetSigningContext(sp)
+		if err != nil {
+			return nil, err
+		}
+
+		sig, err := signingContext.SignString(query)
+		if err != nil {
+			return nil, err
+		}
+		query += "&Signature=" + url.QueryEscape(base64.StdEncoding.EncodeToString(sig))
+	}
+
+	rv.RawQuery = query
+
+	return rv, nil
 }
 
 // MakePostLogoutRequest creates a SAML authentication request using
 // the HTTP-POST binding. It returns HTML text representing an HTML form that
 // can be sent presented to a browser to initiate the logout process.
-func (sp *ServiceProvider) MakePostLogoutRequest(nameID, relayState string) ([]byte, error) {
-	req, err := sp.MakeLogoutRequest(sp.GetSLOBindingLocation(HTTPPostBinding), nameID)
+func (sp *ServiceProvider) MakePostLogoutRequest(nameID, relayState, sessionID string) ([]byte, error) {
+	req, err := sp.MakeLogoutRequest(sp.GetSLOBindingLocation(HTTPPostBinding), nameID, sessionID)
 	if err != nil {
 		return nil, err
 	}

@@ -31,6 +31,8 @@ type Options struct {
 	CookieName            string
 	RelayStateFunc        func(w http.ResponseWriter, r *http.Request) string
 	LogoutBindings        []string
+
+	CreateIdpInitializedRedirectURI func(relayState string) string
 }
 
 // DefaultSessionCodec returns the default SessionCodec for the provided options,
@@ -138,12 +140,20 @@ func DefaultServiceProvider(opts Options) saml.ServiceProvider {
 // replacing and/or changing Session, RequestTracker, and ServiceProvider
 // in the returned Middleware.
 func New(opts Options) (*Middleware, error) {
+	// preserve current behavior if not set
+	redirectFn := opts.CreateIdpInitializedRedirectURI
+	if redirectFn == nil {
+		redirectFn = DefaultIdpInitializedRedirectURI
+	}
+
 	m := &Middleware{
 		ServiceProvider: DefaultServiceProvider(opts),
 		Binding:         "",
 		ResponseBinding: saml.HTTPPostBinding,
 		OnError:         DefaultOnError,
 		Session:         DefaultSessionProvider(opts),
+
+		CreateIdpInitializedRedirectURI: redirectFn,
 	}
 	m.RequestTracker = DefaultRequestTracker(opts, &m.ServiceProvider)
 	if opts.UseArtifactResponse {
@@ -151,4 +161,8 @@ func New(opts Options) (*Middleware, error) {
 	}
 
 	return m, nil
+}
+
+func DefaultIdpInitializedRedirectURI(relayState string) string {
+	return relayState
 }
