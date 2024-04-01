@@ -124,7 +124,7 @@ type ServiceProvider struct {
 	// HTTP-POST binding is used.
 	LogoutBindings []string
 
-	AllowNoSignatureLogout bool
+	SignatureErrorHandler func(err error) error
 }
 
 // MaxIssueDelay is the longest allowed time between when a SAML assertion is
@@ -1586,10 +1586,12 @@ func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData str
 	}
 
 	if err := sp.validateSignature(doc.Root()); err != nil {
-		if err == errSignatureElementNotPresent && sp.AllowNoSignatureLogout {
-			logger.DefaultLogger.Println("SLO request is unsigned. AllowNoSignatureLogout enabled; skipping validation")
-		} else {
-			retErr.PrivateErr = err
+		sigErr := err
+		if sp.SignatureErrorHandler != nil {
+			sigErr = sp.SignatureErrorHandler(err)
+		}
+		if sigErr != nil {
+			retErr.PrivateErr = sigErr
 			return retErr
 		}
 	}

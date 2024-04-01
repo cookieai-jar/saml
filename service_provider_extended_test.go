@@ -3,7 +3,6 @@ package saml
 import (
 	"bytes"
 	"compress/gzip"
-	"crypto/rsa"
 	"encoding/base64"
 	"encoding/xml"
 	"errors"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	dsig "github.com/russellhaering/goxmldsig"
+	"github.com/stretchr/testify/require"
 	"gotest.tools/assert"
 	is "gotest.tools/assert/cmp"
 	"gotest.tools/golden"
@@ -58,17 +58,21 @@ func TestValidateLogoutResponseRedirectNoSignatureElement(t *testing.T) {
 		return rv
 	}
 	Clock = dsig.NewFakeClockAt(TimeNow())
-	t.Run("AllowNoSignatureElementDisabled", func(t *testing.T) {
+	t.Run("SignatureErrorHandlerReturned", func(t *testing.T) {
 		test := NewServiceProviderTest(t)
+		handled := false
 		s := ServiceProvider{
-			Key:                    test.Key,
-			Certificate:            test.Certificate,
-			MetadataURL:            mustParseURL("https://15661444.ngrok.io/saml2/metadata"),
-			AcsURL:                 mustParseURL("https://15661444.ngrok.io/saml2/acs"),
-			SignatureMethod:        dsig.RSASHA256SignatureMethod,
-			SloURL:                 mustParseURL("https://idp.testshib.org/idp/profile/SAML2/Redirect/SLO"),
-			IDPMetadata:            &EntityDescriptor{},
-			AllowNoSignatureLogout: false, // flag under test
+			Key:             test.Key,
+			Certificate:     test.Certificate,
+			MetadataURL:     mustParseURL("https://15661444.ngrok.io/saml2/metadata"),
+			AcsURL:          mustParseURL("https://15661444.ngrok.io/saml2/acs"),
+			SignatureMethod: dsig.RSASHA256SignatureMethod,
+			SloURL:          mustParseURL("https://idp.testshib.org/idp/profile/SAML2/Redirect/SLO"),
+			IDPMetadata:     &EntityDescriptor{},
+			SignatureErrorHandler: func(err error) error {
+				handled = true
+				return err
+			},
 		}
 		err := xml.Unmarshal(test.IDPMetadata, &s.IDPMetadata)
 		assert.Check(t, err)
@@ -80,18 +84,23 @@ func TestValidateLogoutResponseRedirectNoSignatureElement(t *testing.T) {
 
 		err = s.ValidateLogoutResponseRedirect(string(data))
 		assertError(t, err, "signature element not present")
+		require.True(t, handled)
 	})
-	t.Run("AllowNoSignatureElementEnabled", func(t *testing.T) {
+	t.Run("SignatureErrorHandlerIgnored", func(t *testing.T) {
 		test := NewServiceProviderTest(t)
+		handled := false
 		s := ServiceProvider{
-			Key:                    test.Key,
-			Certificate:            test.Certificate,
-			MetadataURL:            mustParseURL("https://15661444.ngrok.io/saml2/metadata"),
-			AcsURL:                 mustParseURL("https://15661444.ngrok.io/saml2/acs"),
-			SignatureMethod:        dsig.RSASHA256SignatureMethod,
-			SloURL:                 mustParseURL("https://idp.testshib.org/idp/profile/SAML2/Redirect/SLO"),
-			IDPMetadata:            &EntityDescriptor{},
-			AllowNoSignatureLogout: true, // flag under test
+			Key:             test.Key,
+			Certificate:     test.Certificate,
+			MetadataURL:     mustParseURL("https://15661444.ngrok.io/saml2/metadata"),
+			AcsURL:          mustParseURL("https://15661444.ngrok.io/saml2/acs"),
+			SignatureMethod: dsig.RSASHA256SignatureMethod,
+			SloURL:          mustParseURL("https://idp.testshib.org/idp/profile/SAML2/Redirect/SLO"),
+			IDPMetadata:     &EntityDescriptor{},
+			SignatureErrorHandler: func(err error) error {
+				handled = true
+				return nil
+			},
 		}
 		err := xml.Unmarshal(test.IDPMetadata, &s.IDPMetadata)
 		assert.Check(t, err)
@@ -102,30 +111,13 @@ func TestValidateLogoutResponseRedirectNoSignatureElement(t *testing.T) {
 		data := golden.Get(t, "TestValidateLogoutResponseRedirectNoSignatureElement_response.txt")
 
 		err = s.ValidateLogoutResponseRedirect(string(data))
-		assertError(t, err, "signature element not present")
+		assertNoError(t, err)
+		require.True(t, handled)
 	})
-}
-
-func NewServiceProviderTest2(t *testing.T) *ServiceProviderTest {
-	TimeNow = func() time.Time {
-		rv, _ := time.Parse("Mon Jan 2 15:04:05 MST 2006", "Mon Dec 1 01:57:09 UTC 2015")
-		return rv
-	}
-	Clock = dsig.NewFakeClockAt(TimeNow())
-
-	RandReader = &testRandomReader{}
-
-	test := ServiceProviderTest{}
-	test.AuthnRequest = golden.Get(t, "SP_AuthnRequest")
-	test.SamlResponse = golden.Get(t, "SP_SamlResponse")
-	test.Key = mustParsePrivateKey(golden.Get(t, "idp_key.pem")).(*rsa.PrivateKey)
-	test.Certificate = mustParseCertificate(golden.Get(t, "idp_cert.pem"))
-	test.IDPMetadata = golden.Get(t, "SP_IDPMetadata")
-	return &test
 }
 
 func TestValidateLogoutResponseRedirectRaw(t *testing.T) {
-	test := NewServiceProviderTest2(t)
+	test := NewServiceProviderTest(t)
 	TimeNow = func() time.Time {
 		return time.Now()
 	}
@@ -175,10 +167,6 @@ func TestValidateLogoutResponseRedirectRaw(t *testing.T) {
 	})
 	t.Run("Ok", func(t *testing.T) {
 		t.Skip() // need to sign response with correct idp cert, which are hardcoded and not dynamic
-		s.AllowNoSignatureLogout = true
-		defer func() {
-			s.AllowNoSignatureLogout = false
-		}()
 
 		redirectURL, err := s.MakeRedirectLogoutResponse("requestID", "relayState")
 		assert.Check(t, err)
