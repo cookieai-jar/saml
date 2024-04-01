@@ -1586,7 +1586,9 @@ func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData str
 	}
 
 	if err := sp.validateSignature(doc.Root()); err != nil {
-		if !sp.AllowNoSignatureLogout {
+		if err == errSignatureElementNotPresent && sp.AllowNoSignatureLogout {
+			logger.DefaultLogger.Println("SLO request is unsigned. AllowNoSignatureLogout enabled; skipping validation")
+		} else {
 			retErr.PrivateErr = err
 			return retErr
 		}
