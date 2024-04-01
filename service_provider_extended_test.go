@@ -51,7 +51,61 @@ func TestSPCanProduceRedirectLogoutRequest_Signed(t *testing.T) {
 	golden.Assert(t, string(decodedRequest), t.Name()+"_decodedRequest")
 }
 
-func TestValidateLogoutResponseRedirect(t *testing.T) {
+func TestValidateLogoutResponseRedirectNoSignatureElement(t *testing.T) {
+	TimeNow = func() time.Time {
+		rv, _ := time.Parse("Mon Jan 2 15:04:05.999999999 UTC 2006", "Mon Dec 1 01:31:21.123456789 UTC 2015")
+		return rv
+	}
+	Clock = dsig.NewFakeClockAt(TimeNow())
+	t.Run("AllowNoSignatureElementDisabled", func(t *testing.T) {
+		test := NewServiceProviderTest(t)
+		s := ServiceProvider{
+			Key:                    test.Key,
+			Certificate:            test.Certificate,
+			MetadataURL:            mustParseURL("https://15661444.ngrok.io/saml2/metadata"),
+			AcsURL:                 mustParseURL("https://15661444.ngrok.io/saml2/acs"),
+			SignatureMethod:        dsig.RSASHA256SignatureMethod,
+			SloURL:                 mustParseURL("https://idp.testshib.org/idp/profile/SAML2/Redirect/SLO"),
+			IDPMetadata:            &EntityDescriptor{},
+			AllowNoSignatureLogout: false, // flag under test
+		}
+		err := xml.Unmarshal(test.IDPMetadata, &s.IDPMetadata)
+		assert.Check(t, err)
+
+		// override the entity id
+		s.IDPMetadata.EntityID = "https://15661444.ngrok.io/saml2/metadata"
+
+		data := golden.Get(t, "TestValidateLogoutResponseRedirectNoSignatureElement_response.txt")
+
+		err = s.ValidateLogoutResponseRedirect(string(data))
+		assertError(t, err, "signature element not present")
+	})
+	t.Run("AllowNoSignatureElementEnabled", func(t *testing.T) {
+		test := NewServiceProviderTest(t)
+		s := ServiceProvider{
+			Key:                    test.Key,
+			Certificate:            test.Certificate,
+			MetadataURL:            mustParseURL("https://15661444.ngrok.io/saml2/metadata"),
+			AcsURL:                 mustParseURL("https://15661444.ngrok.io/saml2/acs"),
+			SignatureMethod:        dsig.RSASHA256SignatureMethod,
+			SloURL:                 mustParseURL("https://idp.testshib.org/idp/profile/SAML2/Redirect/SLO"),
+			IDPMetadata:            &EntityDescriptor{},
+			AllowNoSignatureLogout: true, // flag under test
+		}
+		err := xml.Unmarshal(test.IDPMetadata, &s.IDPMetadata)
+		assert.Check(t, err)
+
+		// override the entity id
+		s.IDPMetadata.EntityID = "https://15661444.ngrok.io/saml2/metadata"
+
+		data := golden.Get(t, "TestValidateLogoutResponseRedirectNoSignatureElement_response.txt")
+
+		err = s.ValidateLogoutResponseRedirect(string(data))
+		assertError(t, err, "signature element not present")
+	})
+}
+
+func TestValidateLogoutResponseRedirectRaw(t *testing.T) {
 	test := NewServiceProviderTest(t)
 	TimeNow = func() time.Time {
 		return time.Now()

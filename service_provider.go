@@ -1606,7 +1606,7 @@ func (sp *ServiceProvider) validateLogoutResponse(resp *LogoutResponse) error {
 		return fmt.Errorf("`Destination` does not match SloURL (expected %q)", sp.SloURL.String())
 	}
 
-	now := time.Now()
+	now := TimeNow()
 	if resp.IssueInstant.Add(MaxIssueDelay).Before(now) {
 		return fmt.Errorf("issueInstant expired at %s", resp.IssueInstant.Add(MaxIssueDelay))
 	}
