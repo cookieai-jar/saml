@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/beevik/etree"
 	dsig "github.com/russellhaering/goxmldsig"
 	"github.com/stretchr/testify/require"
 	"gotest.tools/assert"
@@ -69,7 +70,10 @@ func TestValidateLogoutResponseRedirectNoSignatureElement(t *testing.T) {
 			SignatureMethod: dsig.RSASHA256SignatureMethod,
 			SloURL:          mustParseURL("https://idp.testshib.org/idp/profile/SAML2/Redirect/SLO"),
 			IDPMetadata:     &EntityDescriptor{},
-			SignatureErrorHandler: func(err error) error {
+			SignatureErrorHandler: func(err error, el *etree.Element) error {
+				if el.Space != "samlp" || el.Tag != "LogoutResponse" {
+					return errors.New("unexpected space or tag")
+				}
 				handled = true
 				return err
 			},
@@ -97,7 +101,10 @@ func TestValidateLogoutResponseRedirectNoSignatureElement(t *testing.T) {
 			SignatureMethod: dsig.RSASHA256SignatureMethod,
 			SloURL:          mustParseURL("https://idp.testshib.org/idp/profile/SAML2/Redirect/SLO"),
 			IDPMetadata:     &EntityDescriptor{},
-			SignatureErrorHandler: func(err error) error {
+			SignatureErrorHandler: func(err error, el *etree.Element) error {
+				if el.Space != "samlp" || el.Tag != "LogoutResponse" {
+					return errors.New("unexpected space or tag")
+				}
 				handled = true
 				return nil
 			},
