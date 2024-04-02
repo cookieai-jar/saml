@@ -123,6 +123,8 @@ type ServiceProvider struct {
 	// LogoutBindings specify the bindings available for SLO endpoint. If empty,
 	// HTTP-POST binding is used.
 	LogoutBindings []string
+
+	SignatureErrorHandler func(err error, el *etree.Element) error
 }
 
 // MaxIssueDelay is the longest allowed time between when a SAML assertion is
@@ -1568,23 +1570,30 @@ func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData str
 
 	gr, err := io.ReadAll(newSaferFlateReader(bytes.NewBuffer(rawResponseBuf)))
 	if err != nil {
-		retErr.PrivateErr = err
+		retErr.PrivateErr = fmt.Errorf("unable to deflate: %s", err)
 		return retErr
 	}
+	retErr.Response = string(gr)
 
 	if err := xrv.Validate(bytes.NewReader(gr)); err != nil {
 		return err
 	}
 
 	doc := etree.NewDocument()
-	if err := doc.ReadFromBytes(rawResponseBuf); err != nil {
+	if err := doc.ReadFromBytes(gr); err != nil {
 		retErr.PrivateErr = err
 		return retErr
 	}
 
 	if err := sp.validateSignature(doc.Root()); err != nil {
-		retErr.PrivateErr = err
-		return retErr
+		sigErr := err
+		if sp.SignatureErrorHandler != nil {
+			sigErr = sp.SignatureErrorHandler(err, doc.Root())
+		}
+		if sigErr != nil {
+			retErr.PrivateErr = sigErr
+			return retErr
+		}
 	}
 
 	var resp LogoutResponse
@@ -1601,7 +1610,7 @@ func (sp *ServiceProvider) validateLogoutResponse(resp *LogoutResponse) error {
 		return fmt.Errorf("`Destination` does not match SloURL (expected %q)", sp.SloURL.String())
 	}
 
-	now := time.Now()
+	now := TimeNow()
 	if resp.IssueInstant.Add(MaxIssueDelay).Before(now) {
 		return fmt.Errorf("issueInstant expired at %s", resp.IssueInstant.Add(MaxIssueDelay))
 	}
