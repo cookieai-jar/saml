@@ -123,8 +123,6 @@ type ServiceProvider struct {
 	// LogoutBindings specify the bindings available for SLO endpoint. If empty,
 	// HTTP-POST binding is used.
 	LogoutBindings []string
-
-	SignatureErrorHandler func(err error, el *etree.Element) error
 }
 
 // MaxIssueDelay is the longest allowed time between when a SAML assertion is
@@ -1503,8 +1501,9 @@ func (sp *ServiceProvider) nameIDFormat() string {
 
 // ValidateLogoutResponseRequest validates the LogoutResponse content from the request
 func (sp *ServiceProvider) ValidateLogoutResponseRequest(req *http.Request) error {
-	if data := req.URL.Query().Get("SAMLResponse"); data != "" {
-		return sp.ValidateLogoutResponseRedirect(data)
+	query := req.URL.Query()
+	if data := query.Get("SAMLResponse"); data != "" {
+		return sp.ValidateLogoutResponseRedirect(query)
 	}
 
 	err := req.ParseForm()
@@ -1556,12 +1555,14 @@ func (sp *ServiceProvider) ValidateLogoutResponseForm(postFormData string) error
 //
 // URL Binding appears to be gzip / flate encoded
 // See https://www.oasis-open.org/committees/download.php/20645/sstc-saml-tech-overview-2%200-draft-10.pdf  6.6
-func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData string) error {
+func (sp *ServiceProvider) ValidateLogoutResponseRedirect(values url.Values) error {
+	samlResponse := values.Get("SAMLResponse")
+
 	retErr := &InvalidResponseError{
 		Now: TimeNow(),
 	}
 
-	rawResponseBuf, err := base64.StdEncoding.DecodeString(queryParameterData)
+	rawResponseBuf, err := base64.StdEncoding.DecodeString(samlResponse)
 	if err != nil {
 		retErr.PrivateErr = fmt.Errorf("unable to parse base64: %s", err)
 		return retErr
@@ -1579,6 +1580,16 @@ func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData str
 		return err
 	}
 
+	// we can receive a signature in the query params or as part of the message
+	hasValidSignature := false
+	if values.Get("Signature") != "" && values.Get("SigAlg") != "" {
+		if err := sp.validateQuerySig(values); err != nil {
+			retErr.PrivateErr = err
+			return retErr
+		}
+		hasValidSignature = true
+	}
+
 	doc := etree.NewDocument()
 	if err := doc.ReadFromBytes(gr); err != nil {
 		retErr.PrivateErr = err
@@ -1586,12 +1597,8 @@ func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData str
 	}
 
 	if err := sp.validateSignature(doc.Root()); err != nil {
-		sigErr := err
-		if sp.SignatureErrorHandler != nil {
-			sigErr = sp.SignatureErrorHandler(err, doc.Root())
-		}
-		if sigErr != nil {
-			retErr.PrivateErr = sigErr
+		if err != errSignatureElementNotPresent || !hasValidSignature {
+			retErr.PrivateErr = err
 			return retErr
 		}
 	}
@@ -1697,17 +1704,26 @@ func findChild(parentEl *etree.Element, childNS string, childTag string) (*etree
 
 func elementToBytes(el *etree.Element) ([]byte, error) {
 	namespaces := map[string]string{}
-	for _, childEl := range el.FindElements("//*") {
-		ns := childEl.NamespaceURI()
-		if ns != "" {
-			namespaces[childEl.Space] = ns
+	currentElement := el
+	// Retrieve namespaces from the element itself and its parents
+	for currentElement != nil {
+		// Iterate over the attributes of the element, if an attribute is a namespace declaration, add it to the list of namespaces
+		for _, attr := range currentElement.Attr {
+			// "xmlns" is either the space or the key of the attribute, depending on whether it is a default namespace declaration or not
+			if attr.Space == "xmlns" || attr.Key == "xmlns" {
+				// If the namespace is already preset in the list, it means that a child element has overridden it, so skip it
+				if _, prefixExists := namespaces[attr.FullKey()]; !prefixExists {
+					namespaces[attr.FullKey()] = attr.Value
+				}
+			}
 		}
+		currentElement = currentElement.Parent()
 	}
 
 	doc := etree.NewDocument()
 	doc.SetRoot(el.Copy())
-	for space, uri := range namespaces {
-		doc.Root().CreateAttr("xmlns:"+space, uri)
+	for prefix, uri := range namespaces {
+		doc.Root().CreateAttr(prefix, uri)
 	}
 
 	return doc.WriteToBytes()
