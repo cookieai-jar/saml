@@ -54,9 +54,9 @@ func (sp *ServiceProvider) validateQuerySig(query url.Values) error {
 	res := respType + "=" + url.QueryEscape(query.Get(respType))
 
 	relayState := query.Get("RelayState")
-	if relayState != "" {
-		res += "&RelayState=" + url.QueryEscape(relayState)
-	}
+	//if relayState != "" {
+	res += "&RelayState=" + url.QueryEscape(relayState)
+	//}
 
 	res += "&SigAlg=" + url.QueryEscape(alg)
 
