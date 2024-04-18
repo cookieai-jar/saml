@@ -27,12 +27,29 @@ var (
 //
 // https://github.com/grafana/saml/blob/a6c0e9b86a4c064fa5a593a0575d8656d533e13e/service_provider_signed.go
 func (sp *ServiceProvider) validateQuerySig(query url.Values) error {
+
+	sig := query.Get("Signature")
+	if sig == "" {
+		return ErrNoQuerySignature
+	}
+
+	// Signature is base64 encoded
+	sigBytes, err := base64.StdEncoding.DecodeString(sig)
+	if err != nil {
+		return fmt.Errorf("failed to decode signature: %w", err)
+	}
+
+	certs, err := sp.getIDPSigningCerts()
+	if err != nil {
+		return err
+	}
+
 	// okta
-	if err := sp.validateQuerySigVariant(query, false); err == nil {
+	if err := sp.validateQuerySigVariant(query, sigBytes, certs, false); err == nil {
 		return nil
 	}
 	// entra
-	if err := sp.validateQuerySigVariant(query, true); err == nil {
+	if err := sp.validateQuerySigVariant(query, sigBytes, certs, true); err == nil {
 		return nil
 	}
 	return ErrInvalidQuerySignature
@@ -42,16 +59,10 @@ func (sp *ServiceProvider) validateQuerySig(query url.Values) error {
 // Query is valid if return is nil
 //
 // https://github.com/grafana/saml/blob/a6c0e9b86a4c064fa5a593a0575d8656d533e13e/service_provider_signed.go
-func (sp *ServiceProvider) validateQuerySigVariant(query url.Values, includeBlankRelayState bool) error {
-	sig := query.Get("Signature")
+func (sp *ServiceProvider) validateQuerySigVariant(query url.Values, sigBytes []byte, certs []*x509.Certificate, includeBlankRelayState bool) error {
 	alg := query.Get("SigAlg")
-	if sig == "" || alg == "" {
+	if alg == "" {
 		return ErrNoQuerySignature
-	}
-
-	certs, err := sp.getIDPSigningCerts()
-	if err != nil {
-		return err
 	}
 
 	respType := ""
@@ -75,12 +86,6 @@ func (sp *ServiceProvider) validateQuerySigVariant(query url.Values, includeBlan
 	}
 
 	res += "&SigAlg=" + url.QueryEscape(alg)
-
-	// Signature is base64 encoded
-	sigBytes, err := base64.StdEncoding.DecodeString(sig)
-	if err != nil {
-		return fmt.Errorf("failed to decode signature: %w", err)
-	}
 
 	var (
 		hashed  []byte
