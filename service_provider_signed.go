@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
+	"strings"
 
 	dsig "github.com/russellhaering/goxmldsig"
 )
@@ -28,14 +30,35 @@ var (
 // https://github.com/grafana/saml/blob/a6c0e9b86a4c064fa5a593a0575d8656d533e13e/service_provider_signed.go
 func (sp *ServiceProvider) validateQuerySig(query url.Values) error {
 	sig := query.Get("Signature")
-	alg := query.Get("SigAlg")
-	if sig == "" || alg == "" {
+	if sig == "" {
 		return ErrNoQuerySignature
+	}
+
+	// Signature is base64 encoded
+	sigBytes, err := base64.StdEncoding.DecodeString(sig)
+	if err != nil {
+		return fmt.Errorf("failed to decode signature: %w", err)
 	}
 
 	certs, err := sp.getIDPSigningCerts()
 	if err != nil {
 		return err
+	}
+
+	// standard url encoding
+	if err := sp.validateQuerySigVariant(query, sigBytes, certs, false); err == nil {
+		return nil
+	}
+	// entra/azure, which requires lowercase url encoding
+	return sp.validateQuerySigVariant(query, sigBytes, certs, true)
+}
+
+// validateQuerySigVariant validates of the signature of the Redirect Binding in query values; supports lowering URL
+// encoding for Entra compatability
+func (sp *ServiceProvider) validateQuerySigVariant(query url.Values, sigBytes []byte, certs []*x509.Certificate, toLowercase bool) error {
+	alg := query.Get("SigAlg")
+	if alg == "" {
+		return ErrNoQuerySignature
 	}
 
 	respType := ""
@@ -60,10 +83,16 @@ func (sp *ServiceProvider) validateQuerySig(query url.Values) error {
 
 	res += "&SigAlg=" + url.QueryEscape(alg)
 
-	// Signature is base64 encoded
-	sigBytes, err := base64.StdEncoding.DecodeString(sig)
-	if err != nil {
-		return fmt.Errorf("failed to decode signature: %w", err)
+	// This lowers URL encoding to be compatible with Entra/AzureAD signatures
+	// See https://github.com/SAML-Toolkits/python3-saml/blob/master/src/onelogin/saml2/utils.py#L72
+	if toLowercase {
+		re, err := regexp.Compile("%[A-F0-9]{2}")
+		if err != nil {
+			return err
+		}
+		res = re.ReplaceAllStringFunc(res, func(s string) string {
+			return strings.ToLower(s)
+		})
 	}
 
 	var (
