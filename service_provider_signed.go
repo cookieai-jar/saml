@@ -27,6 +27,22 @@ var (
 //
 // https://github.com/grafana/saml/blob/a6c0e9b86a4c064fa5a593a0575d8656d533e13e/service_provider_signed.go
 func (sp *ServiceProvider) validateQuerySig(query url.Values) error {
+	// okta
+	if err := sp.validateQuerySigVariant(query, false); err == nil {
+		return nil
+	}
+	// entra
+	if err := sp.validateQuerySigVariant(query, true); err == nil {
+		return nil
+	}
+	return ErrInvalidQuerySignature
+}
+
+// validateSig validation of the signature of the Redirect Binding in query values
+// Query is valid if return is nil
+//
+// https://github.com/grafana/saml/blob/a6c0e9b86a4c064fa5a593a0575d8656d533e13e/service_provider_signed.go
+func (sp *ServiceProvider) validateQuerySigVariant(query url.Values, includeBlankRelayState bool) error {
 	sig := query.Get("Signature")
 	alg := query.Get("SigAlg")
 	if sig == "" || alg == "" {
@@ -54,9 +70,9 @@ func (sp *ServiceProvider) validateQuerySig(query url.Values) error {
 	res := respType + "=" + url.QueryEscape(query.Get(respType))
 
 	relayState := query.Get("RelayState")
-	//if relayState != "" {
-	res += "&RelayState=" + url.QueryEscape(relayState)
-	//}
+	if includeBlankRelayState || relayState != "" {
+		res += "&RelayState=" + url.QueryEscape(relayState)
+	}
 
 	res += "&SigAlg=" + url.QueryEscape(alg)
 
