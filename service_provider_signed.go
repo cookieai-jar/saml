@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
+	"strings"
 
 	dsig "github.com/russellhaering/goxmldsig"
 )
@@ -27,7 +29,6 @@ var (
 //
 // https://github.com/grafana/saml/blob/a6c0e9b86a4c064fa5a593a0575d8656d533e13e/service_provider_signed.go
 func (sp *ServiceProvider) validateQuerySig(query url.Values) error {
-
 	sig := query.Get("Signature")
 	if sig == "" {
 		return ErrNoQuerySignature
@@ -59,7 +60,7 @@ func (sp *ServiceProvider) validateQuerySig(query url.Values) error {
 // Query is valid if return is nil
 //
 // https://github.com/grafana/saml/blob/a6c0e9b86a4c064fa5a593a0575d8656d533e13e/service_provider_signed.go
-func (sp *ServiceProvider) validateQuerySigVariant(query url.Values, sigBytes []byte, certs []*x509.Certificate, includeBlankRelayState bool) error {
+func (sp *ServiceProvider) validateQuerySigVariant(query url.Values, sigBytes []byte, certs []*x509.Certificate, toLowercase bool) error {
 	alg := query.Get("SigAlg")
 	if alg == "" {
 		return ErrNoQuerySignature
@@ -81,11 +82,22 @@ func (sp *ServiceProvider) validateQuerySigVariant(query url.Values, sigBytes []
 	res := respType + "=" + url.QueryEscape(query.Get(respType))
 
 	relayState := query.Get("RelayState")
-	if includeBlankRelayState || relayState != "" {
+	if relayState != "" {
 		res += "&RelayState=" + url.QueryEscape(relayState)
 	}
 
 	res += "&SigAlg=" + url.QueryEscape(alg)
+
+	if toLowercase {
+		re, err := regexp.Compile("%[A-F0-9]{2}")
+		if err != nil {
+			return err
+		}
+
+		res = re.ReplaceAllStringFunc(res, func(s string) string {
+			return strings.ToLower(s)
+		})
+	}
 
 	var (
 		hashed  []byte
