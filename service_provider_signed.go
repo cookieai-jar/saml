@@ -88,12 +88,12 @@ func (sp *ServiceProvider) validateQuerySigVariant(query url.Values, sigBytes []
 
 	res += "&SigAlg=" + url.QueryEscape(alg)
 
+	// special workaround to validate Entra/AzureAD
 	if toLowercase {
 		re, err := regexp.Compile("%[A-F0-9]{2}")
 		if err != nil {
 			return err
 		}
-
 		res = re.ReplaceAllStringFunc(res, func(s string) string {
 			return strings.ToLower(s)
 		})
