@@ -2,9 +2,11 @@ package saml
 
 import (
 	"crypto/rsa"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/xml"
 	"net/url"
+	"regexp"
 	"testing"
 
 	dsig "github.com/russellhaering/goxmldsig"
@@ -87,6 +89,56 @@ func TestSigningAndValidation(t *testing.T) {
 			assert.NilError(t, err, "error validating query: %s", err)
 		})
 	}
+}
+
+// TestValidation_AzureEntra compatability test with Azure, which requires url encoding to be lowercased
+func TestValidation_AzureEntra(t *testing.T) {
+	certStr := "MIIC8DCCAdigAwIBAgIQXzpLPP73pKBCobXFPkIGbDANBgkqhkiG9w0BAQsFADA0MTIwMAYDVQQD\nEylNaWNyb3NvZnQgQXp1cmUgRmVkZXJhdGVkIFNTTyBDZXJ0aWZpY2F0ZTAeFw0yNDA0MTYxMzM5\nNTBaFw0yNzA0MTYxMzM5NTBaMDQxMjAwBgNVBAMTKU1pY3Jvc29mdCBBenVyZSBGZWRlcmF0ZWQg\nU1NPIENlcnRpZmljYXRlMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuXwYN9Nq6tzq\n3KmGE6Wb7gvR99ezuCCjqd0VljFtt1B57yiQf7o9JLqGWhRgSqlLgctKdqyISYCr4KsFQOwKDow+\nu/2sJe4129xlI4f1vXC+uGByKvFwn4tRpIyhmYjRT4pnTSbLEJ4y2i34ZhUiic1s057AY78H5gX7\nwCAS9EzWN5GE5vzSaQBlhjH8c7lfMi7NPjh3Y1QwEYhQfgGZ8cpceppYz4uaJ0JqOhz+NzHi7OBd\n+Srw8LmgVvaZcoC+CAVDkNCJejfwckTz8Jo5ZK5ngih3ecXkfjoUs9sSArrd7O90EmWj+rx6NFwn\nZ5SRLxg/Ek0hDeLL9r/zXGLk1QIDAQABMA0GCSqGSIb3DQEBCwUAA4IBAQApGAHsj1+9fV2niS2V\nMhd3IxBbogu/RQ/3eKuZLmmmQFtp/cBxLIT1wNazh5mXMvd4CYITdDJSmDzxdbBOApxwk7VdudQL\n0VTzYO9NBrt88Lvmat+7L7M0QRw1y/iYF6oZLLNw6bkY0SwHgmoNQQVnup7kJT54/LzZJ8Fhh8mc\nUc/uLzlTuWY7plmVSM7dicMhcYHGiSn2BPet9Infl0DV2O728G5cosVs0bTFX6s5g24H2ysbQSHF\na3OuYpHdVZTX7fDlYC4otqC+JI1Y2x1PPx7b9wK2ezDl5u3kd+r9QViFXo6vxrVpv3Za9zl1oP8M\nYeO8oWPlmQrEpPq2usJ8\n"
+	requestType := samlResponse
+	request := "fZJBT8MwDIX%2fSpV7mmRNsyTqKiG4TIILQxy4IKd1WUWXTHUq%2bPmUTRyQEEdbfn7vk90QnKazv09vacmPSOcUCYv93Y69oq3AuNDxTZCBaxmQ21ojd1ZXdQjaDDaw4hlnGlPcsU0pWbEnWnAfKUPMa0tuNJeaK%2fuknFdbX6tSW%2fnCijukPEbIF%2bUx5zN5ITLGVabKLqX3EWEs8zrlrbRKwJKP4juqoCmtNvEn6lPasbHnIDfg7FaroXYhGNRKaWOdqrZYmd51sjMQ5OBY8XmaIvkL9Y4tc%2fQJaCQf4YTkc%2bcPNw%2f3fmXx5znl1KWJtc2Far5K%2fxcBEc7fVKz9oaJM5ccY%2b%2fRBZcQswFjTD9ueo6st11gPPGhruTE16MqCAtmLRlw92%2bZ6n0OGvNDv6jb1WDzDtOD%2fmegy7Q9L1yERE20jfi8Vf%2f1A%2bwU%3d"
+	signature := "lInEk5gHMixezv6xlcIBcScceeTzoI9qrw0Oeho8ARlTFjsiuk3J%2fODzv3bo526Dl0rrqIBLC%2bmnRHWoy5hSbKHnpy6sR3WEQu6RRVp4d1Uf6kgGXfiZDM9eXMwjSYoTN3OhX3vNzlF2iXY8cWy06xIH3V9EwE8K4DYeheUP0%2b8jGRkvyWlKqKTLQSSem%2bHp9LkuH8LcODXPleWTJD1TXpiYHbCszJxdTE2ueNW2UNiLB4M4zFSNahA%2bpXRWkyEnHMAxozq5ugpvDVomqX%2f9Gjc9135gzEVz%2f04EWtXLgBEa%2fPUKObheQpLEufqfeFUhGEQRlpHQ3u72CyvbxWAhxg%3d%3d"
+	algorithm := "http%3a%2f%2fwww.w3.org%2f2001%2f04%2fxmldsig-more%23rsa-sha256"
+
+	// parse pem certificate
+	regex := regexp.MustCompile(`\s+`)
+	certStr = regex.ReplaceAllString(certStr, "")
+	certBytes, err := base64.StdEncoding.DecodeString(certStr)
+	if err != nil {
+		panic(err)
+	}
+	cert, err := x509.ParseCertificate(certBytes)
+	if err != nil {
+		panic(err)
+	}
+
+	idpMetadata := golden.Get(t, "SP_IDPMetadata_signing_entra")
+	s := ServiceProvider{
+		Key:             mustParsePrivateKey(golden.Get(t, "idp_key.pem")).(*rsa.PrivateKey), // placeholder; not used
+		Certificate:     cert,
+		MetadataURL:     mustParseURL("https://15661444.ngrok.io/saml2/metadata"),
+		AcsURL:          mustParseURL("https://15661444.ngrok.io/saml2/acs"),
+		SignatureMethod: dsig.RSASHA256SignatureMethod,
+	}
+
+	err = xml.Unmarshal(idpMetadata, &s.IDPMetadata)
+	assert.NilError(t, err)
+
+	idpCert, err := s.getIDPSigningCerts()
+
+	assert.Check(t, err == nil)
+	assert.Check(t,
+		s.Certificate.Issuer.CommonName == idpCert[0].Issuer.CommonName, "expected %s, got %s",
+		s.Certificate.Issuer.CommonName, idpCert[0].Issuer.CommonName)
+
+	rawQuery := string(requestType) + "=" + request
+	rawQuery += "&Signature=" + signature
+	rawQuery += "&SigAlg=" + algorithm
+
+	query, err := url.ParseQuery(rawQuery)
+	assert.NilError(t, err, "error parsing query: %s", err)
+
+	err = s.validateQuerySig(query)
+	assert.NilError(t, err, "error validating query: %s", err)
 }
 
 // Given a raw query with an unsupported signature method, the signature should be rejected.
