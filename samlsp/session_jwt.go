@@ -47,6 +47,13 @@ func (c JWTSessionCodec) New(assertion *saml.Assertion) (Session, error) {
 		}
 	}
 
+	// pick a stricter time if available
+	if conditions := assertion.Conditions; conditions != nil {
+		if !conditions.NotOnOrAfter.IsZero() && conditions.NotOnOrAfter.Before(time.Unix(claims.ExpiresAt, 0)) {
+			claims.ExpiresAt = conditions.NotOnOrAfter.Unix()
+		}
+	}
+
 	claims.Attributes = map[string][]string{}
 
 	for _, attributeStatement := range assertion.AttributeStatements {
