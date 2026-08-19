@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt/v4"
 	dsig "github.com/russellhaering/goxmldsig"
 	"gotest.tools/assert"
 	is "gotest.tools/assert/cmp"
@@ -27,7 +26,6 @@ func NewCustomMiddlewareTest(t *testing.T, moreOpts ...func(*Options)) *Middlewa
 		rv, _ := time.Parse("Mon Jan 2 15:04:05.999999999 MST 2006", "Mon Dec 1 01:57:09.123456789 UTC 2015")
 		return rv
 	}
-	jwt.TimeFunc = saml.TimeNow
 	saml.Clock = dsig.NewFakeClockAt(saml.TimeNow())
 	saml.RandReader = &testRandomReader{}
 
