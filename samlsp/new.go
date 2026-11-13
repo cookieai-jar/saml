@@ -199,6 +199,7 @@ func New(opts Options) (*Middleware, error) {
 	return m, nil
 }
 
+// DefaultIdpInitializedRedirectURI redirects to the RelayState unchanged.
 func DefaultIdpInitializedRedirectURI(relayState string) string {
 	return relayState
 }

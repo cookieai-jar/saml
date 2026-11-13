@@ -107,7 +107,7 @@ func TestMiddlewareIdpInitializedRelayState(t *testing.T) {
 	t.Run("NoRedirect", func(t *testing.T) {
 		test := NewCustomMiddlewareTest(t, func(options *Options) {
 			options.AllowIDPInitiated = true
-			options.CreateIdpInitializedRedirectURI = func(relayState string) string {
+			options.CreateIdpInitializedRedirectURI = func(_ string) string {
 				return "/"
 			}
 		})

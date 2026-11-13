@@ -3,7 +3,7 @@ package saml
 import (
 	"crypto"
 	"crypto/rsa"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // required for protocol support
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/x509"
@@ -22,6 +22,8 @@ var (
 	ErrInvalidQuerySignature = errors.New("invalid query signature")
 	// ErrNoQuerySignature is returned when the query does not contain a signature
 	ErrNoQuerySignature = errors.New("query Signature or SigAlg not found")
+
+	urlEncodingRe = regexp.MustCompile("%[A-F0-9]{2}")
 )
 
 // validateSig validation of the signature of the Redirect Binding in query values
@@ -54,7 +56,7 @@ func (sp *ServiceProvider) validateQuerySig(query url.Values) error {
 }
 
 // validateQuerySigVariant validates of the signature of the Redirect Binding in query values; supports lowering URL
-// encoding for Entra compatability
+// encoding for Entra compatibility
 func (sp *ServiceProvider) validateQuerySigVariant(query url.Values, sigBytes []byte, certs []*x509.Certificate, toLowercase bool) error {
 	alg := query.Get("SigAlg")
 	if alg == "" {
@@ -86,13 +88,7 @@ func (sp *ServiceProvider) validateQuerySigVariant(query url.Values, sigBytes []
 	// This lowers URL encoding to be compatible with Entra/AzureAD signatures
 	// See https://github.com/SAML-Toolkits/python3-saml/blob/master/src/onelogin/saml2/utils.py#L72
 	if toLowercase {
-		re, err := regexp.Compile("%[A-F0-9]{2}")
-		if err != nil {
-			return err
-		}
-		res = re.ReplaceAllStringFunc(res, func(s string) string {
-			return strings.ToLower(s)
-		})
+		res = urlEncodingRe.ReplaceAllStringFunc(res, strings.ToLower)
 	}
 
 	var (
