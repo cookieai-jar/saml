@@ -581,3 +581,7 @@ func New(opts Options) (*Middleware, error) {
 
 	return m, nil
 }
+
+func DefaultIdpInitializedRedirectURI(relayState string) string {
+	return relayState
+}

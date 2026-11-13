@@ -3009,14 +3009,35 @@ func (r *LogoutRequest) Redirect(relayState string) *url.URL {
 
 	rv, _ := url.Parse(r.Destination)
 
-	query := rv.Query()
-	query.Set("SAMLRequest", w.String())
-	if relayState != "" {
-		query.Set("RelayState", relayState)
+	query := rv.RawQuery
+	if len(query) > 0 {
+		query += "&SAMLRequest=" + url.QueryEscape(w.String())
+	} else {
+		query += "SAMLRequest=" + url.QueryEscape(w.String())
 	}
-	rv.RawQuery = query.Encode()
 
-	return rv
+	if relayState != "" {
+		query += "&RelayState=" + relayState
+	}
+
+	// No relay state used
+	if len(sp.SignatureMethod) > 0 {
+		query += "&SigAlg=" + url.QueryEscape(sp.SignatureMethod)
+		signingContext, err := GetSigningContext(sp)
+		if err != nil {
+			return nil, err
+		}
+
+		sig, err := signingContext.SignString(query)
+		if err != nil {
+			return nil, err
+		}
+		query += "&Signature=" + url.QueryEscape(base64.StdEncoding.EncodeToString(sig))
+	}
+
+	rv.RawQuery = query
+
+	return rv, nil
 }
 
 // MakePostLogoutRequest creates a SAML authentication request using
@@ -3497,6 +3518,7 @@ func (sp *ServiceProvider) validateLogoutResponse(resp *LogoutResponse) error {
 	if resp.Destination != sp.SloURL.String() {
 		return classify(fmt.Errorf("`Destination` does not match SloURL (expected %q)", sp.SloURL.String()), ErrDestinationMismatch)
 	}
+	retErr.Response = string(gr)
 
 	now := sp.now()
 	if err := checkIssueInstant("issueInstant", resp.IssueInstant, now); err != nil {
@@ -3837,6 +3859,7 @@ func elementWithNamespaces(el *etree.Element) *etree.Element {
 		if prefix, ok := namespaceDeclPrefix(attr); ok {
 			declared[prefix] = true
 		}
+		currentElement = currentElement.Parent()
 	}
 
 	// Walk outward so the nearest declaration of each prefix wins.
