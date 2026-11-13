@@ -21,9 +21,12 @@ type Shortcut struct {
 	// If specified then the relay state is the fixed string provided
 	RelayState *string `json:"relay_state,omitempty"`
 
-	// If true then the URL suffix is used as the relayState. So for example, a user
-	// requesting https://idp.example.com/login/myservice/foo will get redirected
-	// to the myservice endpoint with a RelayState of "foo".
+	// If true then the URL path after the shortcut name is used as the
+	// RelayState, with its leading slash. So for example, a user requesting
+	// https://idp.example.com/login/myservice/foo will get redirected to the
+	// myservice endpoint with a RelayState of "/foo", and one requesting
+	// https://idp.example.com/login/myservice/foo/bar with "/foo/bar". With
+	// no suffix, the RelayState is empty. RelayState takes precedence.
 	URISuffixAsRelayState bool `json:"url_suffix_as_relay_state,omitempty"`
 }
 
@@ -51,7 +54,7 @@ func (s *Server) HandleGetShortcut(w http.ResponseWriter, r *http.Request) {
 	shortcut := Shortcut{}
 	err := s.Store.Get(fmt.Sprintf("/shortcuts/%s", r.PathValue("id")), &shortcut)
 	if err != nil {
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		s.storeError(w, err)
 		return
 	}
 	if err := json.NewEncoder(w).Encode(shortcut); err != nil {
@@ -82,7 +85,7 @@ func (s *Server) HandlePutShortcut(w http.ResponseWriter, r *http.Request) {
 func (s *Server) HandleDeleteShortcut(w http.ResponseWriter, r *http.Request) {
 	err := s.Store.Delete(fmt.Sprintf("/shortcuts/%s", r.PathValue("id")))
 	if err != nil {
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		s.storeError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -95,8 +98,7 @@ func (s *Server) HandleIDPInitiated(w http.ResponseWriter, r *http.Request) {
 	shortcutName := r.PathValue("shortcut")
 	shortcut := Shortcut{}
 	if err := s.Store.Get(fmt.Sprintf("/shortcuts/%s", shortcutName), &shortcut); err != nil {
-		s.logger.Printf("ERROR: %s", err)
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		s.storeError(w, err)
 		return
 	}
 
@@ -110,7 +112,5 @@ func (s *Server) HandleIDPInitiated(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.idpConfigMu.RLock()
-	defer s.idpConfigMu.RUnlock()
 	s.IDP.ServeIDPInitiated(w, r, shortcut.ServiceProviderID, relayState)
 }

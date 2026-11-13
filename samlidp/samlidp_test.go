@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"gotest.tools/assert"
-	is "gotest.tools/assert/cmp"
-	"gotest.tools/golden"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/golden"
 
 	"github.com/crewjam/saml"
 	"github.com/crewjam/saml/logger"
@@ -136,7 +136,7 @@ func TestHTTPCanSSORequest(t *testing.T) {
 	test.Server.ServeHTTP(w, r)
 	assert.Check(t, is.Equal(http.StatusOK, w.Code))
 	assert.Check(t,
-		strings.HasPrefix(w.Body.String(), "<html><p></p><form method=\"post\" action=\"https://idp.example.com/login\">"),
+		strings.HasPrefix(w.Body.String(), "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>Log in</title></head><body><p></p><form method=\"post\" action=\"https://idp.example.com/sso\">"),
 		w.Body.String())
 	golden.Assert(t, w.Body.String(), "http_sso_response.html")
 }

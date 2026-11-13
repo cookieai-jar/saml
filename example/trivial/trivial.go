@@ -1,15 +1,26 @@
 // Package main contains an example service provider implementation.
+//
+// The IdP metadata names the certificates trusted to sign assertions, so it
+// is loaded from a file you downloaded and checked once, not fetched from
+// the network at every start:
+//
+//	curl -o idp-metadata.xml https://www.samltest.dev/apps/<APP_ID>/metadata
+//	go run ./example/trivial -idp-metadata idp-metadata.xml
+//
+// To fetch it at start-up instead, use samlsp.FetchSignedMetadata with the
+// IdP's metadata signing certificate.
 package main
 
 import (
-	"context"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"time"
 
 	"github.com/crewjam/saml/samlsp"
@@ -18,67 +29,72 @@ import (
 var samlMiddleware *samlsp.Middleware
 
 func hello(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Hello, %s!", samlsp.AttributeFromContext(r.Context(), "displayName"))
-}
-
-func logout(w http.ResponseWriter, r *http.Request) {
-	nameID := samlsp.AttributeFromContext(r.Context(), "urn:oasis:names:tc:SAML:attribute:subject-id")
-	url, err := samlMiddleware.ServiceProvider.MakeRedirectLogoutRequest(nameID, "", "")
-	if err != nil {
-		panic(err) // TODO handle error
-	}
-
-	err = samlMiddleware.Session.DeleteSession(w, r)
-	if err != nil {
-		panic(err) // TODO handle error
-	}
-
-	w.Header().Add("Location", url.String())
-	w.WriteHeader(http.StatusFound)
+	// An error writing to the client cannot be reported back to it.
+	_, _ = fmt.Fprintf(w, "Hello, %s!", samlsp.AttributeFromContext(r.Context(), "displayName"))
 }
 
 func main() {
+	idpMetadataPath := flag.String("idp-metadata", "",
+		"file holding the IDP metadata, downloaded e.g. from https://www.samltest.dev/apps/<APP_ID>/metadata")
+	flag.Parse()
+	if *idpMetadataPath == "" {
+		log.Fatal("-idp-metadata is required")
+	}
+
 	keyPair, err := tls.LoadX509KeyPair("myservice.cert", "myservice.key")
 	if err != nil {
-		panic(err) // TODO handle error
+		log.Fatal(err)
 	}
 	keyPair.Leaf, err = x509.ParseCertificate(keyPair.Certificate[0])
 	if err != nil {
-		panic(err) // TODO handle error
+		log.Fatal(err)
 	}
 
-	idpMetadataURL, err := url.Parse("https://samltest.id/saml/idp")
-	if err != nil {
-		panic(err) // TODO handle error
+	key, ok := keyPair.PrivateKey.(*rsa.PrivateKey)
+	if !ok {
+		log.Fatal("myservice.key must hold an RSA private key")
 	}
-	idpMetadata, err := samlsp.FetchMetadata(context.Background(), http.DefaultClient,
-		*idpMetadataURL)
+
+	idpMetadataXML, err := os.ReadFile(*idpMetadataPath)
 	if err != nil {
-		panic(err) // TODO handle error
+		log.Fatal(err)
+	}
+	idpMetadata, err := samlsp.ParseMetadata(idpMetadataXML)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	rootURL, err := url.Parse("http://localhost:8000")
 	if err != nil {
-		panic(err) // TODO handle error
+		log.Fatal(err)
 	}
 
-	samlMiddleware, _ = samlsp.New(samlsp.Options{
+	samlMiddleware, err = samlsp.New(samlsp.Options{
 		URL:         *rootURL,
-		Key:         keyPair.PrivateKey.(*rsa.PrivateKey),
+		Key:         key,
 		Certificate: keyPair.Leaf,
 		IDPMetadata: idpMetadata,
 		SignRequest: true, // some IdP require the SLO request to be signed
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 	app := http.HandlerFunc(hello)
-	slo := http.HandlerFunc(logout)
 
 	http.Handle("/hello", samlMiddleware.RequireAccount(app))
+	// samlMiddleware serves /saml/metadata, /saml/acs and the single logout
+	// endpoint /saml/slo.
 	http.Handle("/saml/", samlMiddleware)
-	http.Handle("/logout", slo)
+	// Visiting /logout ends the local session and sends the user to the IDP
+	// to log out there too (SP initiated single logout).
+	http.HandleFunc("/logout", samlMiddleware.HandleStartLogout)
 
 	server := &http.Server{
-		Addr:              ":8080",
+		Addr:              "localhost:8000",
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
 	}
 	log.Fatal(server.ListenAndServe())
 }

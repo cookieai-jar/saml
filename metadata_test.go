@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"gotest.tools/assert"
-	is "gotest.tools/assert/cmp"
-	"gotest.tools/golden"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/golden"
 )
 
 func TestCanParseMetadata(t *testing.T) {
@@ -172,4 +172,282 @@ func TestMetadataValidatesUrlSchemeForProtocolBinding(t *testing.T) {
 	metadata := EntityDescriptor{}
 	err := xml.Unmarshal(buf, &metadata)
 	assert.Error(t, err, "invalid url scheme \"javascript\" for binding \"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST\"")
+}
+
+func TestEntityDescriptorOmitsUnsetValidUntil(t *testing.T) {
+	// validUntil is optional; an unset value must not be rendered as the zero
+	// time (which consumers would treat as already-expired metadata).
+	buf, err := xml.Marshal(EntityDescriptor{EntityID: "https://sp.example.com/saml2/metadata"})
+	assert.Check(t, err)
+	assert.Check(t, is.Equal(string(buf),
+		`<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://sp.example.com/saml2/metadata"></EntityDescriptor>`))
+
+	// Round-tripping metadata without validUntil must not introduce one.
+	var ed EntityDescriptor
+	assert.Check(t, xml.Unmarshal(buf, &ed))
+	assert.Check(t, ed.ValidUntil.IsZero())
+	buf2, err := xml.Marshal(ed)
+	assert.Check(t, err)
+	assert.Check(t, is.Equal(string(buf), string(buf2)))
+
+	// A set validUntil is still emitted.
+	ed.ValidUntil = time.Date(2015, 12, 3, 1, 57, 9, 0, time.UTC)
+	buf, err = xml.Marshal(ed)
+	assert.Check(t, err)
+	assert.Check(t, is.Contains(string(buf), `validUntil="2015-12-03T01:57:09Z"`))
+}
+
+func TestRoleDescriptorDurationsRoundTrip(t *testing.T) {
+	// cacheDuration on a role descriptor is an xsd:duration and validUntil an
+	// xsd:dateTime, exactly as on EntityDescriptor (saml-metadata-2.0-os §2.4.1).
+	validUntil := time.Date(2030, time.January, 2, 3, 4, 5, 678000000, time.UTC)
+	roleDescriptor := func() RoleDescriptor {
+		vu := validUntil
+		return RoleDescriptor{
+			ValidUntil:                 &vu,
+			CacheDuration:              time.Hour,
+			ProtocolSupportEnumeration: "urn:oasis:names:tc:SAML:2.0:protocol",
+		}
+	}
+
+	testCases := []struct {
+		element string
+		get     func(EntityDescriptor) []RoleDescriptor
+		set     func(*EntityDescriptor)
+	}{
+		{
+			element: "IDPSSODescriptor",
+			get: func(ed EntityDescriptor) (rv []RoleDescriptor) {
+				for _, d := range ed.IDPSSODescriptors {
+					rv = append(rv, d.RoleDescriptor)
+				}
+				return rv
+			},
+			set: func(ed *EntityDescriptor) {
+				ed.IDPSSODescriptors = []IDPSSODescriptor{{SSODescriptor: SSODescriptor{RoleDescriptor: roleDescriptor()}}}
+			},
+		},
+		{
+			element: "SPSSODescriptor",
+			get: func(ed EntityDescriptor) (rv []RoleDescriptor) {
+				for _, d := range ed.SPSSODescriptors {
+					rv = append(rv, d.RoleDescriptor)
+				}
+				return rv
+			},
+			set: func(ed *EntityDescriptor) {
+				ed.SPSSODescriptors = []SPSSODescriptor{{SSODescriptor: SSODescriptor{RoleDescriptor: roleDescriptor()}}}
+			},
+		},
+		{
+			element: "AuthnAuthorityDescriptor",
+			get: func(ed EntityDescriptor) (rv []RoleDescriptor) {
+				for _, d := range ed.AuthnAuthorityDescriptors {
+					rv = append(rv, d.RoleDescriptor)
+				}
+				return rv
+			},
+			set: func(ed *EntityDescriptor) {
+				ed.AuthnAuthorityDescriptors = []AuthnAuthorityDescriptor{{RoleDescriptor: roleDescriptor()}}
+			},
+		},
+		{
+			element: "PDPDescriptor",
+			get: func(ed EntityDescriptor) (rv []RoleDescriptor) {
+				for _, d := range ed.PDPDescriptors {
+					rv = append(rv, d.RoleDescriptor)
+				}
+				return rv
+			},
+			set: func(ed *EntityDescriptor) {
+				ed.PDPDescriptors = []PDPDescriptor{{RoleDescriptor: roleDescriptor()}}
+			},
+		},
+		{
+			element: "AttributeAuthorityDescriptor",
+			get: func(ed EntityDescriptor) (rv []RoleDescriptor) {
+				for _, d := range ed.AttributeAuthorityDescriptors {
+					rv = append(rv, d.RoleDescriptor)
+				}
+				return rv
+			},
+			set: func(ed *EntityDescriptor) {
+				ed.AttributeAuthorityDescriptors = []AttributeAuthorityDescriptor{{RoleDescriptor: roleDescriptor()}}
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.element, func(t *testing.T) {
+			// Unmarshal
+			input := `<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://example.com/metadata">` +
+				`<` + tc.element + ` protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol" cacheDuration="PT1H" validUntil="2030-01-02T03:04:05.678Z"></` + tc.element + `>` +
+				`</EntityDescriptor>`
+			var ed EntityDescriptor
+			assert.NilError(t, xml.Unmarshal([]byte(input), &ed))
+			got := tc.get(ed)
+			assert.Assert(t, is.Len(got, 1))
+			assert.Check(t, is.Equal(got[0].CacheDuration, time.Hour))
+			assert.Assert(t, got[0].ValidUntil != nil)
+			assert.Check(t, got[0].ValidUntil.Equal(validUntil))
+
+			// Marshal
+			ed = EntityDescriptor{EntityID: "https://example.com/metadata"}
+			tc.set(&ed)
+			buf, err := xml.Marshal(ed)
+			assert.NilError(t, err)
+			assert.Check(t, is.Contains(string(buf), `<`+tc.element+` `))
+			assert.Check(t, is.Contains(string(buf), ` cacheDuration="PT1H"`))
+			assert.Check(t, is.Contains(string(buf), ` validUntil="2030-01-02T03:04:05.678Z"`))
+
+			// Round trip
+			var ed2 EntityDescriptor
+			assert.NilError(t, xml.Unmarshal(buf, &ed2))
+			assert.Check(t, is.DeepEqual(tc.get(ed2), tc.get(ed)))
+		})
+	}
+}
+
+func TestRoleDescriptorOmitsUnsetDurations(t *testing.T) {
+	ed := EntityDescriptor{
+		EntityID: "https://example.com/metadata",
+		IDPSSODescriptors: []IDPSSODescriptor{{SSODescriptor: SSODescriptor{RoleDescriptor: RoleDescriptor{
+			ProtocolSupportEnumeration: "urn:oasis:names:tc:SAML:2.0:protocol",
+		}}}},
+		PDPDescriptors: []PDPDescriptor{{RoleDescriptor: RoleDescriptor{
+			ProtocolSupportEnumeration: "urn:oasis:names:tc:SAML:2.0:protocol",
+		}}},
+	}
+	buf, err := xml.Marshal(ed)
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(string(buf),
+		`<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://example.com/metadata">`+
+			`<IDPSSODescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"></IDPSSODescriptor>`+
+			`<PDPDescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"></PDPDescriptor>`+
+			`</EntityDescriptor>`))
+
+	var ed2 EntityDescriptor
+	assert.NilError(t, xml.Unmarshal(buf, &ed2))
+	assert.Check(t, ed2.IDPSSODescriptors[0].ValidUntil == nil)
+	assert.Check(t, is.Equal(ed2.IDPSSODescriptors[0].CacheDuration, time.Duration(0)))
+}
+
+func TestAffiliationDescriptorDurationsRoundTrip(t *testing.T) {
+	// cacheDuration on an AffiliationDescriptor is an xsd:duration and
+	// validUntil an xsd:dateTime, as on the role descriptors
+	// (saml-metadata-2.0-os §2.5).
+	validUntil := time.Date(2030, time.January, 2, 3, 4, 5, 678000000, time.UTC)
+
+	// Unmarshal, including a validUntil without a time zone, which only
+	// RelaxedTime accepts.
+	input := `<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://example.com/metadata">` +
+		`<AffiliationDescriptor affiliationOwnerID="https://example.com/owner" cacheDuration="PT1H" validUntil="2030-01-02T03:04:05.678">` +
+		`<Extensions><x:Thing xmlns:x="urn:example:x">kept</x:Thing></Extensions>` +
+		`<AffiliateMember>https://member.example.com/</AffiliateMember>` +
+		`</AffiliationDescriptor></EntityDescriptor>`
+	var ed EntityDescriptor
+	assert.NilError(t, xml.Unmarshal([]byte(input), &ed))
+	ad := ed.AffiliationDescriptor
+	assert.Assert(t, ad != nil)
+	assert.Check(t, is.Equal(ad.CacheDuration, time.Hour))
+	assert.Check(t, ad.ValidUntil.Equal(validUntil))
+	assert.Check(t, is.Equal(ad.AffiliationOwnerID, "https://example.com/owner"))
+	assert.Check(t, is.DeepEqual(ad.AffiliateMembers, []string{"https://member.example.com/"}))
+	assert.Assert(t, ad.Extensions != nil)
+	assert.Assert(t, is.Len(ad.Extensions.Other, 1))
+	assert.Check(t, is.Equal(ad.Extensions.Other[0].CharData, "kept"))
+
+	// Marshal
+	buf, err := xml.Marshal(ed)
+	assert.NilError(t, err)
+	assert.Check(t, is.Contains(string(buf), ` cacheDuration="PT1H"`))
+	assert.Check(t, is.Contains(string(buf), ` validUntil="2030-01-02T03:04:05.678Z"`))
+	assert.Check(t, is.Contains(string(buf), `kept</Thing></Extensions>`))
+
+	// Round trip
+	var ed2 EntityDescriptor
+	assert.NilError(t, xml.Unmarshal(buf, &ed2))
+	assert.Assert(t, ed2.AffiliationDescriptor != nil)
+	assert.Check(t, is.Equal(ed2.AffiliationDescriptor.CacheDuration, time.Hour))
+	assert.Check(t, ed2.AffiliationDescriptor.ValidUntil.Equal(validUntil))
+	assert.Check(t, is.DeepEqual(ed2.AffiliationDescriptor.AffiliateMembers, ad.AffiliateMembers))
+	assert.Assert(t, ed2.AffiliationDescriptor.Extensions != nil)
+	assert.Check(t, is.Len(ed2.AffiliationDescriptor.Extensions.Other, 1))
+}
+
+func TestAffiliationDescriptorOmitsUnsetDurations(t *testing.T) {
+	ad := AffiliationDescriptor{AffiliationOwnerID: "https://example.com/owner"}
+	buf, err := xml.Marshal(ad)
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(string(buf),
+		`<AffiliationDescriptor affiliationOwnerID="https://example.com/owner"></AffiliationDescriptor>`))
+
+	var ad2 AffiliationDescriptor
+	assert.NilError(t, xml.Unmarshal(buf, &ad2))
+	assert.Check(t, ad2.ValidUntil.IsZero())
+	assert.Check(t, is.Equal(ad2.CacheDuration, time.Duration(0)))
+}
+
+func TestCanParseIDPMetadataWithRoleDescriptorCacheDuration(t *testing.T) {
+	// IdP metadata in the wild sets cacheDuration (and sometimes validUntil,
+	// without a time zone) on the IDPSSODescriptor rather than on the
+	// EntityDescriptor.
+	input := `<?xml version="1.0" encoding="UTF-8"?>
+<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" entityID="https://idp.example.com/saml2/idp">
+  <md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol" WantAuthnRequestsSigned="false" cacheDuration="PT604800S" validUntil="2030-01-02T03:04:05.678">
+    <md:KeyDescriptor use="signing">
+      <ds:KeyInfo>
+        <ds:X509Data>
+          <ds:X509Certificate>MIIB</ds:X509Certificate>
+        </ds:X509Data>
+      </ds:KeyInfo>
+    </md:KeyDescriptor>
+    <md:NameIDFormat>urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress</md:NameIDFormat>
+    <md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="https://idp.example.com/saml2/idp/sso"/>
+    <md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://idp.example.com/saml2/idp/sso"/>
+  </md:IDPSSODescriptor>
+</md:EntityDescriptor>`
+
+	var ed EntityDescriptor
+	assert.NilError(t, xml.Unmarshal([]byte(input), &ed))
+	assert.Assert(t, is.Len(ed.IDPSSODescriptors, 1))
+	idp := ed.IDPSSODescriptors[0]
+	assert.Check(t, is.Equal(idp.XMLName, xml.Name{Space: "urn:oasis:names:tc:SAML:2.0:metadata", Local: "IDPSSODescriptor"}))
+	assert.Check(t, is.Equal(idp.CacheDuration, 7*24*time.Hour))
+	assert.Assert(t, idp.ValidUntil != nil)
+	assert.Check(t, idp.ValidUntil.Equal(time.Date(2030, time.January, 2, 3, 4, 5, 678000000, time.UTC)))
+	assert.Check(t, is.Len(idp.KeyDescriptors, 1))
+	assert.Check(t, is.Len(idp.SingleSignOnServices, 2))
+}
+
+func TestMetadataKeepsHTTPPostSimpleSignLocations(t *testing.T) {
+	// HTTP-POST-SimpleSign is an HTTP binding. Endpoints that use it must keep
+	// their Location rather than having it blanked like an unknown binding.
+	input := `<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://example.com/metadata">
+  <IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+    <SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST-SimpleSign" Location="https://idp.example.com/sso"/>
+  </IDPSSODescriptor>
+  <SPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+    <AssertionConsumerService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST-SimpleSign" Location="https://sp.example.com/acs" index="1"/>
+  </SPSSODescriptor>
+</EntityDescriptor>`
+
+	var ed EntityDescriptor
+	assert.NilError(t, xml.Unmarshal([]byte(input), &ed))
+	assert.Assert(t, is.Len(ed.IDPSSODescriptors, 1))
+	assert.Assert(t, is.Len(ed.IDPSSODescriptors[0].SingleSignOnServices, 1))
+	sso := ed.IDPSSODescriptors[0].SingleSignOnServices[0]
+	assert.Check(t, is.Equal(sso.Binding, HTTPPostSimpleSignBinding))
+	assert.Check(t, is.Equal(sso.Location, "https://idp.example.com/sso"))
+	assert.Assert(t, is.Len(ed.SPSSODescriptors, 1))
+	assert.Assert(t, is.Len(ed.SPSSODescriptors[0].AssertionConsumerServices, 1))
+	assert.Check(t, is.Equal(ed.SPSSODescriptors[0].AssertionConsumerServices[0].Location, "https://sp.example.com/acs"))
+
+	// Like the other HTTP bindings, a non-HTTP scheme is rejected.
+	bad := `<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://example.com/metadata">
+  <SPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+    <AssertionConsumerService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST-SimpleSign" Location="javascript:alert(1)" index="1"/>
+  </SPSSODescriptor>
+</EntityDescriptor>`
+	assert.Check(t, is.ErrorContains(xml.Unmarshal([]byte(bad), &EntityDescriptor{}), `invalid url scheme "javascript"`))
 }

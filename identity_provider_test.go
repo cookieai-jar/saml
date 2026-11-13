@@ -20,9 +20,9 @@ import (
 	"testing"
 	"time"
 
-	"gotest.tools/assert"
-	is "gotest.tools/assert/cmp"
-	"gotest.tools/golden"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/golden"
 
 	"github.com/beevik/etree"
 	dsig "github.com/russellhaering/goxmldsig"
@@ -199,6 +199,9 @@ func TestIDPCanProduceMetadata(t *testing.T) {
 									},
 								},
 								EncryptionMethods: []EncryptionMethod{
+									{Algorithm: "http://www.w3.org/2009/xmlenc11#aes256-gcm"},
+									{Algorithm: "http://www.w3.org/2009/xmlenc11#aes128-gcm"},
+									{Algorithm: "http://www.w3.org/2009/xmlenc11#aes192-gcm"},
 									{Algorithm: "http://www.w3.org/2001/04/xmlenc#aes128-cbc"},
 									{Algorithm: "http://www.w3.org/2001/04/xmlenc#aes192-cbc"},
 									{Algorithm: "http://www.w3.org/2001/04/xmlenc#aes256-cbc"},
@@ -225,6 +228,59 @@ func TestIDPCanProduceMetadata(t *testing.T) {
 	assert.Check(t, is.DeepEqual(expected, test.IDP.Metadata()))
 }
 
+func TestIDPMetadataPublishesExtraCertificates(t *testing.T) {
+	test := NewIdentityProviderTest(t, applyKey)
+	// Any certificate other than the IdP's own will do as the "next" key.
+	nextCert := test.SPCertificate
+	test.IDP.ExtraCertificates = []*x509.Certificate{nil, nextCert}
+
+	metadata := test.IDP.Metadata()
+	assert.Assert(t, is.Len(metadata.IDPSSODescriptors, 1))
+	keyDescriptors := metadata.IDPSSODescriptors[0].KeyDescriptors
+	assert.Assert(t, is.Len(keyDescriptors, 3))
+
+	certStr := base64.StdEncoding.EncodeToString(test.Certificate.Raw)
+	nextCertStr := base64.StdEncoding.EncodeToString(nextCert.Raw)
+
+	// The primary certificate is still published first, for signing and
+	// encryption, exactly as before.
+	assert.Check(t, is.Equal(keyDescriptors[0].Use, "signing"))
+	assert.Check(t, is.DeepEqual(keyDescriptors[0].KeyInfo.X509Data.X509Certificates, []X509Certificate{{Data: certStr}}))
+	assert.Check(t, is.Equal(keyDescriptors[1].Use, "encryption"))
+	assert.Check(t, is.DeepEqual(keyDescriptors[1].KeyInfo.X509Data.X509Certificates, []X509Certificate{{Data: certStr}}))
+
+	// The extra certificate is published as a signing key only; the nil
+	// entry is skipped.
+	assert.Check(t, is.Equal(keyDescriptors[2].Use, "signing"))
+	assert.Check(t, is.DeepEqual(keyDescriptors[2].KeyInfo.X509Data.X509Certificates, []X509Certificate{{Data: nextCertStr}}))
+	assert.Check(t, is.Len(keyDescriptors[2].EncryptionMethods, 0))
+
+	buf, err := xml.Marshal(metadata)
+	assert.NilError(t, err)
+	assert.Check(t, is.Contains(string(buf), nextCertStr))
+
+	// A service provider using this metadata trusts both certificates, so
+	// it keeps working when the IdP switches to the new key.
+	var parsed EntityDescriptor
+	assert.NilError(t, xml.Unmarshal(buf, &parsed))
+	sp := ServiceProvider{IDPMetadata: &parsed}
+	certs, err := sp.getIDPSigningCerts()
+	assert.NilError(t, err)
+	assert.Assert(t, is.Len(certs, 2))
+	assert.Check(t, certs[0].Equal(test.Certificate))
+	assert.Check(t, certs[1].Equal(nextCert))
+}
+
+func TestIDPCanAdvertiseCustomNameIDFormats(t *testing.T) {
+	test := NewIdentityProviderTest(t, applyKey)
+	test.IDP.NameIDFormats = []NameIDFormat{
+		EmailAddressNameIDFormat,
+		PersistentNameIDFormat,
+	}
+	got := test.IDP.Metadata().IDPSSODescriptors[0].NameIDFormats
+	assert.Check(t, is.DeepEqual(test.IDP.NameIDFormats, got))
+}
+
 func TestIDPHTTPCanHandleMetadataRequest(t *testing.T) {
 	test := NewIdentityProviderTest(t, applyKey)
 	w := httptest.NewRecorder()
@@ -234,6 +290,50 @@ func TestIDPHTTPCanHandleMetadataRequest(t *testing.T) {
 	assert.Check(t, is.Equal("application/samlmetadata+xml", w.Header().Get("Content-type")))
 	assert.Check(t, strings.HasPrefix(w.Body.String(), "<EntityDescriptor"),
 		w.Body.String())
+}
+
+func TestIDPCanServeSignedMetadata(t *testing.T) {
+	for name, opt := range map[string]idpTestOpts{"key": applyKey, "signer": applySigner} {
+		t.Run(name, func(t *testing.T) {
+			test := NewIdentityProviderTest(t, opt)
+			test.IDP.SignMetadata = true
+
+			w := httptest.NewRecorder()
+			r, _ := http.NewRequest("GET", "https://idp.example.com/saml/metadata", nil)
+			test.IDP.Handler().ServeHTTP(w, r)
+			assert.Check(t, is.Equal(http.StatusOK, w.Code))
+
+			doc := etree.NewDocument()
+			assert.NilError(t, doc.ReadFromBytes(w.Body.Bytes()))
+			root := doc.Root()
+			assert.Check(t, is.Equal("EntityDescriptor", root.Tag))
+			assert.Check(t, root.SelectAttrValue("ID", "") != "")
+
+			// the schema requires ds:Signature to be the first child
+			first := root.ChildElements()[0]
+			assert.Check(t, is.Equal("Signature", first.Tag))
+			assert.Check(t, is.Equal("http://www.w3.org/2000/09/xmldsig#", first.NamespaceURI()))
+
+			validationContext := dsig.NewDefaultValidationContext(&dsig.MemoryX509CertificateStore{
+				Roots: []*x509.Certificate{test.Certificate},
+			})
+			validationContext.Clock = dsig.NewFakeClockAt(test.Certificate.NotBefore)
+			_, err := validationContext.Validate(root)
+			assert.NilError(t, err)
+
+			// tampering with the metadata invalidates the signature
+			tampered := root.Copy()
+			tampered.CreateAttr("entityID", "https://evil.example.com/")
+			_, err = validationContext.Validate(tampered)
+			assert.Check(t, err != nil)
+
+			// the signed document is still ordinary, parseable metadata
+			var ed EntityDescriptor
+			assert.NilError(t, xml.Unmarshal(w.Body.Bytes(), &ed))
+			assert.Check(t, is.Equal(test.IDP.MetadataURL.String(), ed.EntityID))
+			assert.Check(t, is.Len(ed.IDPSSODescriptors, 1))
+		})
+	}
 }
 
 func TestIDPCanHandleRequestWithNewSession(t *testing.T) {
@@ -265,6 +365,7 @@ func TestIDPCanHandleRequestWithNewSession(t *testing.T) {
 
 func TestIDPCanHandleRequestWithExistingSession(t *testing.T) {
 	test := NewIdentityProviderTest(t, applyKey)
+	test.IDP.AssertionEncrypter = cbcAssertionEncrypter() // keep the golden file stable
 	test.IDP.SessionProvider = &mockSessionProvider{
 		GetSessionFunc: func(_ http.ResponseWriter, _ *http.Request, _ *IdpAuthnRequest) *Session {
 			return &Session{
@@ -290,6 +391,7 @@ func TestIDPCanHandleRequestWithExistingSession(t *testing.T) {
 
 func TestIDPCanHandlePostRequestWithExistingSession(t *testing.T) {
 	test := NewIdentityProviderTest(t, applyKey)
+	test.IDP.AssertionEncrypter = cbcAssertionEncrypter() // keep the golden file stable
 	test.IDP.SessionProvider = &mockSessionProvider{
 		GetSessionFunc: func(_ http.ResponseWriter, _ *http.Request, _ *IdpAuthnRequest) *Session {
 			return &Session{
@@ -347,7 +449,7 @@ func TestIDPCanParse(t *testing.T) {
 
 	r, _ = http.NewRequest("GET", "https://idp.example.com/saml/sso?RelayState=ThisIsTheRelayState", nil)
 	_, err = NewIdpAuthnRequest(&test.IDP, r)
-	assert.Check(t, is.Error(err, "cannot decompress request: unexpected EOF"))
+	assert.Check(t, is.Error(err, "query does not contain SAMLRequest"))
 
 	r, _ = http.NewRequest("GET", "https://idp.example.com/saml/sso?RelayState=ThisIsTheRelayState&SAMLRequest=NotValidBase64", nil)
 	_, err = NewIdpAuthnRequest(&test.IDP, r)
@@ -679,8 +781,55 @@ func TestIDPMakeAssertion(t *testing.T) {
 	assert.Check(t, is.DeepEqual(expectedAttributes, req.Assertion.AttributeStatements[0].Attributes))
 }
 
+func TestIDPMakeAssertionAddressWithoutPort(t *testing.T) {
+	// SubjectConfirmationData/@Address and SubjectLocality/@Address are
+	// network addresses; the port from http.Request.RemoteAddr must not be
+	// included (saml-core-2.0-os §2.4.1.2, §2.7.2.1).
+	testCases := []struct {
+		remoteAddr string
+		want       string
+	}{
+		{remoteAddr: "192.0.2.1:1234", want: "192.0.2.1"},
+		{remoteAddr: "[::1]:1234", want: "::1"},
+		{remoteAddr: "[2001:db8::1]:443", want: "2001:db8::1"},
+		{remoteAddr: "192.0.2.1", want: "192.0.2.1"},
+		{remoteAddr: "2001:db8::1", want: "2001:db8::1"},
+		{remoteAddr: "", want: ""},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.remoteAddr, func(t *testing.T) {
+			test := NewIdentityProviderTest(t, applyKey)
+			req := IdpAuthnRequest{
+				Now: TimeNow(),
+				IDP: &test.IDP,
+				RequestBuffer: []byte("" +
+					"<AuthnRequest xmlns=\"urn:oasis:names:tc:SAML:2.0:protocol\" " +
+					"  AssertionConsumerServiceURL=\"https://sp.example.com/saml2/acs\" " +
+					"  Destination=\"https://idp.example.com/saml/sso\" " +
+					"  ID=\"id-00020406080a0c0e10121416181a1c1e\" " +
+					"  IssueInstant=\"2015-12-01T01:57:09Z\" ProtocolBinding=\"\" " +
+					"  Version=\"2.0\">" +
+					"  <Issuer xmlns=\"urn:oasis:names:tc:SAML:2.0:assertion\" " +
+					"    Format=\"urn:oasis:names:tc:SAML:2.0:nameid-format:entity\">https://sp.example.com/saml2/metadata</Issuer>" +
+					"</AuthnRequest>"),
+			}
+			req.HTTPRequest, _ = http.NewRequest("POST", "http://idp.example.com/saml/sso", nil)
+			req.HTTPRequest.RemoteAddr = tc.remoteAddr
+			assert.NilError(t, req.Validate())
+
+			assert.NilError(t, DefaultAssertionMaker{}.MakeAssertion(&req, &Session{
+				ID:     "f00df00df00d",
+				NameID: "alice",
+			}))
+			assert.Check(t, is.Equal(req.Assertion.Subject.SubjectConfirmations[0].SubjectConfirmationData.Address, tc.want))
+			assert.Check(t, is.Equal(req.Assertion.AuthnStatements[0].SubjectLocality.Address, tc.want))
+		})
+	}
+}
+
 func TestIDPMarshalAssertion(t *testing.T) {
 	test := NewIdentityProviderTest(t, applyKey)
+	test.IDP.AssertionEncrypter = cbcAssertionEncrypter() // keep the golden file stable
 	req := IdpAuthnRequest{
 		Now: TimeNow(),
 		IDP: &test.IDP,
@@ -709,7 +858,7 @@ func TestIDPMarshalAssertion(t *testing.T) {
 	assert.Check(t, err)
 
 	// Compare the plaintext first
-	expectedPlaintext := "<saml:Assertion xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"id-00020406080a0c0e10121416181a1c1e20222426\" IssueInstant=\"2015-12-01T01:57:09Z\" Version=\"2.0\"><saml:Issuer Format=\"urn:oasis:names:tc:SAML:2.0:nameid-format:entity\">https://idp.example.com/saml/metadata</saml:Issuer><ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/><ds:SignatureMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#rsa-sha1\"/><ds:Reference URI=\"#id-00020406080a0c0e10121416181a1c1e20222426\"><ds:Transforms><ds:Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/><ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/></ds:Transforms><ds:DigestMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#sha1\"/><ds:DigestValue>gjE0eLUMVt+kK0rIGYvnzHV/2Ok=</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>Jm1rrxo2x7SYTnaS97bCdnVLQGeQuCMTjiSUvwzBkWFR+xcPr+n38dXmv0q0R68tO7L2ELhLtBdLm/dWsxruN23TMGVQyHIPMgJExdnYb7fwqx6es/NAdbDUBTbSdMX0vhIlTsHu5F0bJ0Tg0iAo9uRk9VeBdkaxtPa7+4yl1PQ=</ds:SignatureValue><ds:KeyInfo><ds:X509Data><ds:X509Certificate>MIIB7zCCAVgCCQDFzbKIp7b3MTANBgkqhkiG9w0BAQUFADA8MQswCQYDVQQGEwJVUzELMAkGA1UECAwCR0ExDDAKBgNVBAoMA2ZvbzESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTEzMTAwMjAwMDg1MVoXDTE0MTAwMjAwMDg1MVowPDELMAkGA1UEBhMCVVMxCzAJBgNVBAgMAkdBMQwwCgYDVQQKDANmb28xEjAQBgNVBAMMCWxvY2FsaG9zdDCBnzANBgkqhkiG9w0BAQEFAAOBjQAwgYkCgYEA1PMHYmhZj308kWLhZVT4vOulqx/9ibm5B86fPWwUKKQ2i12MYtz07tzukPymisTDhQaqyJ8Kqb/6JjhmeMnEOdTvSPmHO8m1ZVveJU6NoKRn/mP/BD7FW52WhbrUXLSeHVSKfWkNk6S4hk9MV9TswTvyRIKvRsw0X/gfnqkroJcCAwEAATANBgkqhkiG9w0BAQUFAAOBgQCMMlIO+GNcGekevKgkakpMdAqJfs24maGb90DvTLbRZRD7Xvn1MnVBBS9hzlXiFLYOInXACMW5gcoRFfeTQLSouMM8o57h0uKjfTmuoWHLQLi6hnF+cvCsEFiJZ4AbF+DgmO6TarJ8O05t8zvnOwJlNCASPZRH/JmF8tX0hoHuAQ==</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature><saml:Subject><saml:NameID Format=\"urn:oasis:names:tc:SAML:2.0:nameid-format:transient\" NameQualifier=\"https://idp.example.com/saml/metadata\" SPNameQualifier=\"https://sp.example.com/saml2/metadata\"/><saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\"><saml:SubjectConfirmationData InResponseTo=\"id-00020406080a0c0e10121416181a1c1e\" NotOnOrAfter=\"2015-12-01T01:58:39Z\" Recipient=\"https://sp.example.com/saml2/acs\"/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotBefore=\"2015-12-01T01:57:09Z\" NotOnOrAfter=\"2015-12-01T01:58:39Z\"><saml:AudienceRestriction><saml:Audience>https://sp.example.com/saml2/metadata</saml:Audience></saml:AudienceRestriction></saml:Conditions><saml:AuthnStatement AuthnInstant=\"0001-01-01T00:00:00Z\"><saml:SubjectLocality/><saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement><saml:AttributeStatement><saml:Attribute FriendlyName=\"uid\" Name=\"urn:oid:0.9.2342.19200300.100.1.1\" NameFormat=\"urn:oasis:names:tc:SAML:2.0:attrname-format:uri\"><saml:AttributeValue xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"xs:string\">alice</saml:AttributeValue></saml:Attribute></saml:AttributeStatement></saml:Assertion>"
+	expectedPlaintext := "<saml:Assertion xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"id-00020406080a0c0e10121416181a1c1e20222426\" IssueInstant=\"2015-12-01T01:57:09Z\" Version=\"2.0\"><saml:Issuer Format=\"urn:oasis:names:tc:SAML:2.0:nameid-format:entity\">https://idp.example.com/saml/metadata</saml:Issuer><ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/><ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/><ds:Reference URI=\"#id-00020406080a0c0e10121416181a1c1e20222426\"><ds:Transforms><ds:Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/><ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/></ds:Transforms><ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/><ds:DigestValue>EGhYhFSFoO9OqpzlqS2QX/I7FZmPoFsRrbwhsRgX2+M=</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>hovEcpKNyDPCc9SOj6UQf56k2r2TubTHRLVFNZNZNpeopV6G+QceibdeYEY43ixHWPY14lWaH/EwknWA5ktDAW2hiM78VC0hi2GaXlJ6N7DAdXHlY5LyEUJNL01rMoO5Bwh4gPrzcYxFzltnERcQT56TT/V9p3mFidL/aNJH0aE=</ds:SignatureValue><ds:KeyInfo><ds:X509Data><ds:X509Certificate>MIIB7zCCAVgCCQDFzbKIp7b3MTANBgkqhkiG9w0BAQUFADA8MQswCQYDVQQGEwJVUzELMAkGA1UECAwCR0ExDDAKBgNVBAoMA2ZvbzESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTEzMTAwMjAwMDg1MVoXDTE0MTAwMjAwMDg1MVowPDELMAkGA1UEBhMCVVMxCzAJBgNVBAgMAkdBMQwwCgYDVQQKDANmb28xEjAQBgNVBAMMCWxvY2FsaG9zdDCBnzANBgkqhkiG9w0BAQEFAAOBjQAwgYkCgYEA1PMHYmhZj308kWLhZVT4vOulqx/9ibm5B86fPWwUKKQ2i12MYtz07tzukPymisTDhQaqyJ8Kqb/6JjhmeMnEOdTvSPmHO8m1ZVveJU6NoKRn/mP/BD7FW52WhbrUXLSeHVSKfWkNk6S4hk9MV9TswTvyRIKvRsw0X/gfnqkroJcCAwEAATANBgkqhkiG9w0BAQUFAAOBgQCMMlIO+GNcGekevKgkakpMdAqJfs24maGb90DvTLbRZRD7Xvn1MnVBBS9hzlXiFLYOInXACMW5gcoRFfeTQLSouMM8o57h0uKjfTmuoWHLQLi6hnF+cvCsEFiJZ4AbF+DgmO6TarJ8O05t8zvnOwJlNCASPZRH/JmF8tX0hoHuAQ==</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature><saml:Subject><saml:NameID Format=\"urn:oasis:names:tc:SAML:2.0:nameid-format:transient\" NameQualifier=\"https://idp.example.com/saml/metadata\" SPNameQualifier=\"https://sp.example.com/saml2/metadata\"/><saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\"><saml:SubjectConfirmationData InResponseTo=\"id-00020406080a0c0e10121416181a1c1e\" NotOnOrAfter=\"2015-12-01T01:58:39Z\" Recipient=\"https://sp.example.com/saml2/acs\"/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotBefore=\"2015-12-01T01:57:09Z\" NotOnOrAfter=\"2015-12-01T01:58:39Z\"><saml:AudienceRestriction><saml:Audience>https://sp.example.com/saml2/metadata</saml:Audience></saml:AudienceRestriction></saml:Conditions><saml:AuthnStatement AuthnInstant=\"0001-01-01T00:00:00Z\"><saml:SubjectLocality/><saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement><saml:AttributeStatement><saml:Attribute FriendlyName=\"uid\" Name=\"urn:oid:0.9.2342.19200300.100.1.1\" NameFormat=\"urn:oasis:names:tc:SAML:2.0:attrname-format:uri\"><saml:AttributeValue xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"xs:string\">alice</saml:AttributeValue></saml:Attribute></saml:AttributeStatement></saml:Assertion>"
 	actualPlaintext := ""
 	{
 		doc := etree.NewDocument()
@@ -822,6 +971,7 @@ func TestIDPIDPInitiatedNewSession(t *testing.T) {
 
 func TestIDPIDPInitiatedExistingSession(t *testing.T) {
 	test := NewIdentityProviderTest(t, applyKey)
+	test.IDP.AssertionEncrypter = cbcAssertionEncrypter() // keep the golden file stable
 	test.IDP.SessionProvider = &mockSessionProvider{
 		GetSessionFunc: func(_ http.ResponseWriter, _ *http.Request, _ *IdpAuthnRequest) *Session {
 			return &Session{
@@ -853,6 +1003,76 @@ func TestIDPIDPInitiatedBadServiceProvider(t *testing.T) {
 	r, _ := http.NewRequest("GET", "https://idp.example.com/services/sp/whoami", nil)
 	test.IDP.ServeIDPInitiated(w, r, "https://wrong.url/metadata", "ThisIsTheRelayState")
 	assert.Check(t, is.Equal(http.StatusNotFound, w.Code))
+}
+
+func TestIDPIDPInitiatedResolvesServiceProviderBeforeSession(t *testing.T) {
+	t.Run("unknown service provider", func(t *testing.T) {
+		test := NewIdentityProviderTest(t, applyKey)
+		getSessionCalled := false
+		test.IDP.SessionProvider = &mockSessionProvider{
+			GetSessionFunc: func(w http.ResponseWriter, _ *http.Request, _ *IdpAuthnRequest) *Session {
+				getSessionCalled = true
+				_, _ = fmt.Fprint(w, "login form")
+				return nil
+			},
+		}
+
+		w := httptest.NewRecorder()
+		r, _ := http.NewRequest("GET", "https://idp.example.com/services/sp/whoami", nil)
+		test.IDP.ServeIDPInitiated(w, r, "https://wrong.url/metadata", "ThisIsTheRelayState")
+		assert.Check(t, is.Equal(http.StatusNotFound, w.Code))
+		assert.Check(t, !getSessionCalled, "GetSession must not be called for an unknown service provider")
+	})
+
+	t.Run("service provider without a POST ACS endpoint", func(t *testing.T) {
+		test := NewIdentityProviderTest(t, applyKey)
+		getSessionCalled := false
+		test.IDP.SessionProvider = &mockSessionProvider{
+			GetSessionFunc: func(w http.ResponseWriter, _ *http.Request, _ *IdpAuthnRequest) *Session {
+				getSessionCalled = true
+				_, _ = fmt.Fprint(w, "login form")
+				return nil
+			},
+		}
+		test.IDP.ServiceProviderProvider = &mockServiceProviderProvider{
+			GetServiceProviderFunc: func(*http.Request, string) (*EntityDescriptor, error) {
+				return &EntityDescriptor{
+					EntityID: "https://sp.example.com/saml2/metadata",
+					SPSSODescriptors: []SPSSODescriptor{{AssertionConsumerServices: []IndexedEndpoint{
+						{Binding: HTTPArtifactBinding, Location: "https://sp.example.com/acs"},
+					}}},
+				}, nil
+			},
+		}
+
+		w := httptest.NewRecorder()
+		r, _ := http.NewRequest("GET", "https://idp.example.com/services/sp/whoami", nil)
+		test.IDP.ServeIDPInitiated(w, r, "https://sp.example.com/saml2/metadata", "ThisIsTheRelayState")
+		assert.Check(t, is.Equal(http.StatusInternalServerError, w.Code))
+		assert.Check(t, !getSessionCalled, "GetSession must not be called when there is no usable ACS endpoint")
+	})
+
+	t.Run("session provider sees the service provider", func(t *testing.T) {
+		test := NewIdentityProviderTest(t, applyKey)
+		getSessionCalled := false
+		test.IDP.SessionProvider = &mockSessionProvider{
+			GetSessionFunc: func(_ http.ResponseWriter, _ *http.Request, req *IdpAuthnRequest) *Session {
+				getSessionCalled = true
+				assert.Assert(t, req.ServiceProviderMetadata != nil)
+				assert.Check(t, is.Equal(req.ServiceProviderMetadata.EntityID, test.SP.MetadataURL.String()))
+				assert.Assert(t, req.ACSEndpoint != nil)
+				assert.Check(t, is.Equal(req.ACSEndpoint.Location, test.SP.AcsURL.String()))
+				assert.Check(t, req.SPSSODescriptor != nil)
+				return &Session{ID: "f00df00df00d", UserName: "alice"}
+			},
+		}
+
+		w := httptest.NewRecorder()
+		r, _ := http.NewRequest("GET", "https://idp.example.com/services/sp/whoami", nil)
+		test.IDP.ServeIDPInitiated(w, r, test.SP.MetadataURL.String(), "ThisIsTheRelayState")
+		assert.Check(t, is.Equal(http.StatusOK, w.Code))
+		assert.Check(t, getSessionCalled)
+	})
 }
 
 func TestIDPCanHandleUnencryptedResponse(t *testing.T) {
@@ -1109,7 +1329,7 @@ func TestIDPRejectDecompressionBomb(t *testing.T) {
 		"SAMLRequest": {encoded},
 	}.Encode(), nil)
 	_, err = NewIdpAuthnRequest(&test.IDP, r)
-	assert.Error(t, err, "cannot decompress request: flate: uncompress limit exceeded (10485760 bytes)")
+	assert.Error(t, err, "cannot decompress request: flate: uncompress limit exceeded (1048576 bytes)")
 }
 
 func TestIDPHTTPCanHandleSSORequest(t *testing.T) {
@@ -1150,5 +1370,96 @@ func TestIDPHTTPCanHandleSSORequest(t *testing.T) {
 			"SAMLRequest="+invalidRequest, nil)
 		test.IDP.Handler().ServeHTTP(w, r)
 		assert.Check(t, is.Equal(http.StatusBadRequest, w.Code))
+	}
+}
+
+func TestIDPMakeAssertionElCustomEncrypter(t *testing.T) {
+	for name, tc := range map[string]struct {
+		encrypter func() xmlenc.RSA
+		keyAlg    string
+	}{
+		"rsa-oaep-mgf1p sha256": {
+			encrypter: func() xmlenc.RSA {
+				e := xmlenc.OAEP()
+				e.DigestMethod = xmlenc.SHA256
+				e.BlockCipher = xmlenc.AES256GCM
+				return e
+			},
+			keyAlg: "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p",
+		},
+		"rsa-oaep sha256": {
+			encrypter: func() xmlenc.RSA {
+				e := xmlenc.OAEP_SHA256()
+				e.BlockCipher = xmlenc.AES256GCM
+				return e
+			},
+			keyAlg: "http://www.w3.org/2009/xmlenc11#rsa-oaep",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			test := NewIdentityProviderTest(t, applyKey)
+			test.IDP.AssertionEncrypter = tc.encrypter()
+
+			req := IdpAuthnRequest{
+				Now:           TimeNow(),
+				IDP:           &test.IDP,
+				RequestBuffer: golden.Get(t, "TestIDPMakeResponse_request_buffer"),
+			}
+			req.HTTPRequest, _ = http.NewRequest("POST", "http://idp.example.com/saml/sso", nil)
+			assert.Assert(t, req.Validate())
+			assert.Assert(t, DefaultAssertionMaker{}.MakeAssertion(&req, &Session{
+				ID:       "f00df00df00d",
+				UserName: "alice",
+			}))
+			assert.Assert(t, req.MakeAssertionEl())
+
+			doc := etree.NewDocument()
+			doc.SetRoot(req.AssertionEl)
+			el := doc.FindElement("//EncryptedAssertion/EncryptedData")
+			assert.Assert(t, el != nil)
+
+			keyEM := el.FindElement("./KeyInfo/EncryptedKey/EncryptionMethod")
+			assert.Assert(t, keyEM != nil)
+			assert.Check(t, is.Equal(tc.keyAlg, keyEM.SelectAttrValue("Algorithm", "")))
+			digestEl := keyEM.FindElement("./DigestMethod")
+			assert.Assert(t, digestEl != nil)
+			assert.Check(t, is.Equal(xmlenc.SHA256.Algorithm(), digestEl.SelectAttrValue("Algorithm", "")))
+
+			blockEl := el.FindElement("./EncryptionMethod")
+			assert.Assert(t, blockEl != nil)
+			assert.Check(t, is.Equal(xmlenc.AES256GCM.Algorithm(), blockEl.SelectAttrValue("Algorithm", "")))
+
+			plaintext, err := xmlenc.Decrypt(test.SPKey, el)
+			assert.Assert(t, err)
+			assert.Check(t, strings.Contains(string(plaintext), "<saml:Assertion "))
+		})
+	}
+}
+
+// An AuthnRequest without an Issuer in the assertion namespace is refused
+// with an error rather than a nil-pointer panic.
+func TestIDPValidateRejectsMissingIssuer(t *testing.T) {
+	test := NewIdentityProviderTest(t, applyKey)
+
+	for name, issuer := range map[string]string{
+		"missing": "",
+		"wrong namespace": "<Issuer xmlns=\"urn:oasis:names:tc:SAML:2.0:protocol\">" +
+			"https://sp.example.com/saml2/metadata</Issuer>",
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := IdpAuthnRequest{
+				Now: TimeNow(),
+				IDP: &test.IDP,
+				RequestBuffer: []byte("" +
+					"<AuthnRequest xmlns=\"urn:oasis:names:tc:SAML:2.0:protocol\" " +
+					"  AssertionConsumerServiceURL=\"https://sp.example.com/saml2/acs\" " +
+					"  Destination=\"https://idp.example.com/saml/sso\" " +
+					"  ID=\"id-00020406080a0c0e10121416181a1c1e\" " +
+					"  IssueInstant=\"2015-12-01T01:57:09Z\" ProtocolBinding=\"\" " +
+					"  Version=\"2.0\">" + issuer +
+					"</AuthnRequest>"),
+			}
+			assert.Check(t, is.Error(req.Validate(), "authn request is missing an issuer"))
+		})
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -16,6 +17,32 @@ import (
 
 var sessionMaxAge = time.Hour
 
+// now returns the current time from the Clock of s.IDP or, if it is nil,
+// from the deprecated saml.TimeNow.
+func (s *Server) now() time.Time {
+	if s.IDP.Clock != nil {
+		return s.IDP.Clock.Now().UTC()
+	}
+	return saml.TimeNow() //nolint:staticcheck // the fallback when no Clock is set
+}
+
+// dummyPasswordHash is compared against the submitted password when the user
+// does not exist (or has no usable password hash), so that every login attempt
+// costs the same bcrypt work. It is a hash of a random value at
+// bcrypt.DefaultCost, the cost HandlePutUser uses for real passwords. A
+// successful comparison against it never authenticates anyone.
+var dummyPasswordHash = []byte("$2a$10$Ovb3BvjFgCzUJjLMY9KjI.vCmY12QV6y0QrT6LdUAT6e/C2NMUx7m")
+
+// compareHashAndPassword is a variable so tests can observe which hash is used.
+var compareHashAndPassword = bcrypt.CompareHashAndPassword
+
+// isBcryptHash reports whether hash is a well-formed bcrypt hash that
+// bcrypt.CompareHashAndPassword will actually do the hashing work for.
+func isBcryptHash(hash []byte) bool {
+	_, err := bcrypt.Cost(hash)
+	return err == nil
+}
+
 // GetSession returns the *Session for this request.
 //
 // If the remote user has specified a username and password in the request
@@ -26,84 +53,225 @@ var sessionMaxAge = time.Hour
 // is returned with an English-language toast telling the user their
 // password was invalid.
 //
-// If a session cookie already exists and represents a valid session,
-// then the session is returned
+// Credentials posted by a browser from another origin are refused with 403
+// Forbidden (see checkLoginOrigin).
 //
-// If neither credentials nor a valid session cookie exist, this function
-// sends a login form and returns nil.
+// If a session cookie already exists and represents a valid session,
+// then the session is returned, unless the AuthnRequest has
+// ForceAuthn="true": the user must then authenticate again, so the login
+// form is sent and the assertion that follows carries a new AuthnInstant
+// (saml-core §3.4.1).
+//
+// If neither credentials nor a usable session exist, this function sends a
+// login form and returns nil. If the AuthnRequest has IsPassive="true", it
+// sends no login form: it answers with a SAML error Response with the
+// status Responder and the second-level status NoPassive instead
+// (saml-core §3.4.1 and §3.2.2.2). A passive request with a usable session
+// gets that session as usual.
 func (s *Server) GetSession(w http.ResponseWriter, r *http.Request, req *saml.IdpAuthnRequest) *saml.Session {
 	// if we received login credentials then maybe we can create a session
 	if r.Method == "POST" && r.PostForm.Get("user") != "" {
-		user := User{}
-		if err := s.Store.Get(fmt.Sprintf("/users/%s", r.PostForm.Get("user")), &user); err != nil {
-			s.logger.Printf("ERROR: User '%s' doesn't exists", r.PostForm.Get("user"))
-			s.sendLoginForm(w, req, "Invalid username or password")
+		if err := s.checkLoginOrigin(r); err != nil {
+			s.logger.Printf("ERROR: refusing cross-origin login: %s", err)
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 			return nil
 		}
+		return s.authenticate(w, r, req)
+	}
 
-		if err := bcrypt.CompareHashAndPassword(user.HashedPassword, []byte(r.PostForm.Get("password"))); err != nil {
-			s.logger.Printf("ERROR: Invalid password for user '%s'", r.PostForm.Get("user"))
-			s.sendLoginForm(w, req, "Invalid username or password")
-			return nil
-		}
-
-		session := &saml.Session{
-			ID:         base64.StdEncoding.EncodeToString(randomBytes(32)),
-			NameID:     user.Email,
-			CreateTime: saml.TimeNow(),
-			ExpireTime: saml.TimeNow().Add(sessionMaxAge),
-			Index:      hex.EncodeToString(randomBytes(32)),
-			UserName:   user.Name,
-			// nolint:gocritic // Groups should be a slice here.
-			Groups:                user.Groups[:],
-			UserEmail:             user.Email,
-			UserCommonName:        user.CommonName,
-			UserSurname:           user.Surname,
-			UserGivenName:         user.GivenName,
-			UserScopedAffiliation: user.ScopedAffiliation,
-		}
-		if err := s.Store.Put(fmt.Sprintf("/sessions/%s", session.ID), &session); err != nil {
+	if !isTrue(req.Request.ForceAuthn) {
+		session, err := s.lookupSession(r)
+		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return nil
 		}
-
-		http.SetCookie(w, &http.Cookie{
-			Name:     "session",
-			Value:    session.ID,
-			MaxAge:   int(sessionMaxAge.Seconds()),
-			HttpOnly: true,
-			Secure:   r.URL.Scheme == "https",
-			Path:     "/",
-		})
-
-		s.logger.Printf("User '%s' authenticated successfully", r.PostForm.Get("user"))
-		return session
+		if session != nil {
+			return session
+		}
 	}
 
-	if sessionCookie, err := r.Cookie("session"); err == nil {
-		session := &saml.Session{}
-		if err := s.Store.Get(fmt.Sprintf("/sessions/%s", sessionCookie.Value), session); err != nil {
-			if err == ErrNotFound {
-				s.sendLoginForm(w, req, "")
-				return nil
-			}
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return nil
-		}
-
-		if saml.TimeNow().After(session.ExpireTime) {
-			s.sendLoginForm(w, req, "")
-			return nil
-		}
-		return session
-	}
-
-	s.sendLoginForm(w, req, "")
+	s.promptLogin(w, req, "")
 	return nil
 }
 
+// authenticate checks the username and password posted in r and, if they
+// are valid, creates a session, sets the session cookie and returns the
+// session. Otherwise it prompts the user to log in again and returns nil.
+//
+// The username comes from the request, so it is logged quoted (%q): a
+// username with a newline or other control characters cannot forge log
+// lines.
+func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, req *saml.IdpAuthnRequest) *saml.Session {
+	user := User{}
+	lookupErr := s.Store.Get(fmt.Sprintf("/users/%s", r.PostForm.Get("user")), &user)
+
+	// Always perform exactly one bcrypt comparison, whether or not the user
+	// exists or has a usable password, so that response timing does not
+	// reveal which usernames are valid.
+	hash := user.HashedPassword
+	if lookupErr != nil || !isBcryptHash(hash) {
+		hash = dummyPasswordHash
+	}
+	compareErr := compareHashAndPassword(hash, []byte(r.PostForm.Get("password")))
+
+	if lookupErr != nil {
+		s.logger.Printf("ERROR: User %q does not exist", r.PostForm.Get("user"))
+		s.promptLogin(w, req, "Invalid username or password")
+		return nil
+	}
+	if compareErr != nil || !isBcryptHash(user.HashedPassword) {
+		s.logger.Printf("ERROR: Invalid password for user %q", r.PostForm.Get("user"))
+		s.promptLogin(w, req, "Invalid username or password")
+		return nil
+	}
+
+	now := s.now()
+	session := &saml.Session{
+		ID:           base64.StdEncoding.EncodeToString(randomBytes(32)),
+		NameID:       user.Email,
+		NameIDFormat: nameIDFormatForEmail(user.Email),
+		CreateTime:   now,
+		ExpireTime:   now.Add(sessionMaxAge),
+		Index:        hex.EncodeToString(randomBytes(32)),
+		UserName:     user.Name,
+		// nolint:gocritic // Groups should be a slice here.
+		Groups:                user.Groups[:],
+		UserEmail:             user.Email,
+		UserCommonName:        user.CommonName,
+		UserSurname:           user.Surname,
+		UserGivenName:         user.GivenName,
+		UserScopedAffiliation: user.ScopedAffiliation,
+	}
+	if err := s.Store.Put(fmt.Sprintf("/sessions/%s", session.ID), &session); err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return nil
+	}
+	s.scheduleSessionDeletion(session)
+
+	http.SetCookie(w, s.sessionCookie(r, session.ID, int(sessionMaxAge.Seconds())))
+
+	s.logger.Printf("User %q authenticated successfully", r.PostForm.Get("user"))
+	return session
+}
+
+// checkLoginOrigin returns an error if r, which posts login credentials,
+// was sent by a browser from a page of another origin.
+//
+// Without this check, a page on any site could post the attacker's own
+// username and password to /login or /sso from the victim's browser (login
+// CSRF): the browser would store the attacker's session cookie and the
+// victim would then be logged in to service providers as the attacker. The
+// login form is served by the IdP itself, so legitimate credentials always
+// come from its own origin.
+//
+// The check uses the Sec-Fetch-Site and Origin headers that browsers send
+// (see http.CrossOriginProtection); the origin of the IdP's configured URL
+// is trusted, so that it also works behind a proxy that changes the Host
+// header. Requests without those headers, which do not come from a
+// browser, are allowed.
+func (s *Server) checkLoginOrigin(r *http.Request) error {
+	protection := http.NewCrossOriginProtection()
+	if u := s.IDP.SSOURL; u.Scheme != "" && u.Host != "" {
+		if err := protection.AddTrustedOrigin(u.Scheme + "://" + u.Host); err != nil {
+			return err
+		}
+	}
+	return protection.Check(r)
+}
+
+// lookupSession returns the unexpired session named by the session cookie
+// in r, or nil if there is no such cookie, no such session or the session
+// has expired. It returns an error only if the store fails.
+func (s *Server) lookupSession(r *http.Request) (*saml.Session, error) {
+	sessionCookie, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		return nil, nil
+	}
+	session := &saml.Session{}
+	if err := s.Store.Get(fmt.Sprintf("/sessions/%s", sessionCookie.Value), session); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if s.now().After(session.ExpireTime) {
+		if s.isPastRetention(session) {
+			if err := s.deleteSession(session.ID); err != nil {
+				s.logger.Printf("ERROR: cannot delete expired session: %s", err)
+			}
+		}
+		return nil, nil
+	}
+	return session, nil
+}
+
+// isPastRetention reports whether session expired more than
+// expiredSessionRetention ago, and can be deleted.
+func (s *Server) isPastRetention(session *saml.Session) bool {
+	return s.now().After(session.ExpireTime.Add(expiredSessionRetention))
+}
+
+// DeleteExpiredSessions deletes the stored sessions, and their recorded
+// participants, that expired more than a day ago. Sessions stop logging
+// anyone in when they expire, but are kept that long so that single logout
+// can still reach the service providers they were used for.
+//
+// The server already deletes each session it stores when it is due, with a
+// timer, and the sessions it finds in the Store when first used; call
+// DeleteExpiredSessions to also catch sessions written by other servers
+// sharing the Store since then, or after Store errors.
+func (s *Server) DeleteExpiredSessions() error {
+	ids, err := s.Store.List("/sessions/")
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		session := &saml.Session{}
+		if err := s.Store.Get(sessionKey(id), session); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			return err
+		}
+		if !s.isPastRetention(session) {
+			continue
+		}
+		if err := s.deleteSession(id); err != nil && !errors.Is(err, ErrNotFound) {
+			return err
+		}
+	}
+	return nil
+}
+
+// promptLogin asks the user to log in with the login form, showing toast.
+// If the AuthnRequest has IsPassive="true", the identity provider must not
+// interact with the user, so it answers with a SAML error Response with the
+// status Responder and NoPassive instead.
+func (s *Server) promptLogin(w http.ResponseWriter, req *saml.IdpAuthnRequest, toast string) {
+	if !isTrue(req.Request.IsPassive) {
+		s.sendLoginForm(w, req, toast)
+		return
+	}
+	err := req.IDP.SendErrorResponse(w, req, &saml.StatusError{
+		TopLevel:    saml.StatusResponder,
+		SecondLevel: saml.StatusNoPassive,
+		Message:     "the user cannot be authenticated passively",
+	})
+	if err != nil {
+		s.logger.Printf("ERROR: cannot answer a passive request: %s", err)
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+	}
+}
+
+// isTrue reports whether an optional boolean attribute is present and true.
+func isTrue(b *bool) bool {
+	return b != nil && *b
+}
+
 var defaultLoginFormTemplate = template.Must(template.New("saml-post-form").Parse(`` +
-	`<html>` +
+	`<html xmlns="http://www.w3.org/1999/xhtml">` +
+	`<head><title>Log in</title></head>` +
+	`<body>` +
 	`<p>{{.Toast}}</p>` +
 	`<form method="post" action="{{.URL}}">` +
 	`<input type="text" name="user" placeholder="user" value="" />` +
@@ -112,16 +280,29 @@ var defaultLoginFormTemplate = template.Must(template.New("saml-post-form").Pars
 	`<input type="hidden" name="RelayState" value="{{.RelayState}}" />` +
 	`<input type="submit" value="Log In" />` +
 	`</form>` +
+	`</body>` +
 	`</html>`))
 
-// sendLoginForm produces a form which requests a username and password and directs the user
-// back to the IDP authorize URL to restart the SAML login flow, this time establishing a
-// session based on the credentials that were provided.
+// sendLoginForm produces a form which requests a username and password. If the form is
+// shown during an SP-initiated flow, it directs the user back to the IDP SSO URL to restart
+// the SAML login flow, this time establishing a session based on the credentials that were
+// provided. Otherwise it posts to the IDP login URL.
 func (s *Server) sendLoginForm(w http.ResponseWriter, req *saml.IdpAuthnRequest, toast string) {
 	tmpl := s.LoginFormTemplate
 	if tmpl == nil {
 		tmpl = defaultLoginFormTemplate
 	}
+
+	// When the form is shown in the middle of an SP-initiated flow, it must post
+	// back to the SSO endpoint together with the original SAMLRequest so that
+	// ServeSSO can authenticate the user and finish the flow. Posting it to the
+	// login endpoint instead would only establish a session and reply with JSON,
+	// leaving the user stranded at the IdP.
+	formURL := req.IDP.LoginURL
+	if len(req.RequestBuffer) > 0 {
+		formURL = req.IDP.SSOURL
+	}
+
 	data := struct {
 		Toast       string
 		URL         string
@@ -129,7 +310,7 @@ func (s *Server) sendLoginForm(w http.ResponseWriter, req *saml.IdpAuthnRequest,
 		RelayState  string
 	}{
 		Toast:       toast,
-		URL:         req.IDP.LoginURL.String(),
+		URL:         formURL.String(),
 		SAMLRequest: base64.StdEncoding.EncodeToString(req.RequestBuffer),
 		RelayState:  req.RelayState,
 	}
@@ -182,7 +363,7 @@ func (s *Server) HandleGetSession(w http.ResponseWriter, r *http.Request) {
 	session := saml.Session{}
 	err := s.Store.Get(fmt.Sprintf("/sessions/%s", r.PathValue("id")), &session)
 	if err != nil {
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		s.storeError(w, err)
 		return
 	}
 	if err := json.NewEncoder(w).Encode(session); err != nil {
@@ -194,10 +375,22 @@ func (s *Server) HandleGetSession(w http.ResponseWriter, r *http.Request) {
 // HandleDeleteSession handles the `DELETE /sessions/:id` request. It invalidates the
 // specified session.
 func (s *Server) HandleDeleteSession(w http.ResponseWriter, r *http.Request) {
-	err := s.Store.Delete(fmt.Sprintf("/sessions/%s", r.PathValue("id")))
+	err := s.deleteSession(r.PathValue("id"))
 	if err != nil {
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		s.storeError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// nameIDFormatForEmail returns the format of a NameID whose value is the
+// user's email address: emailAddress, rather than the transient format
+// saml.DefaultAssertionMaker assumes when none is given, since an email
+// address is neither random nor short-lived (saml-core §8.3.8). It returns
+// "" for a user with no email address, keeping the transient default.
+func nameIDFormatForEmail(email string) string {
+	if email == "" {
+		return ""
+	}
+	return string(saml.EmailAddressNameIDFormat)
 }
