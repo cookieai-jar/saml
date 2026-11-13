@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"gotest.tools/assert"
-	is "gotest.tools/assert/cmp"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestSessionsCrud(t *testing.T) {
@@ -31,7 +31,7 @@ func TestSessionsCrud(t *testing.T) {
 	r.Header.Set("Content-type", "application/x-www-form-urlencoded")
 	test.Server.ServeHTTP(w, r)
 	assert.Check(t, is.Equal(http.StatusOK, w.Code))
-	assert.Check(t, is.Equal("session=AAIEBggKDA4QEhQWGBocHiAiJCYoKiwuMDI0Njg6PD4=; Path=/; Max-Age=3600; HttpOnly; Secure",
+	assert.Check(t, is.Equal("session=AAIEBggKDA4QEhQWGBocHiAiJCYoKiwuMDI0Njg6PD4=; Path=/; Max-Age=3600; HttpOnly; Secure; SameSite=None",
 		w.Header().Get("Set-Cookie")))
 	assert.Check(t, is.Equal("{\"ID\":\"AAIEBggKDA4QEhQWGBocHiAiJCYoKiwuMDI0Njg6PD4=\",\"CreateTime\":\"2015-12-01T01:57:09Z\",\"ExpireTime\":\"2015-12-01T02:57:09Z\",\"Index\":\"40424446484a4c4e50525456585a5c5e60626466686a6c6e70727476787a7c7e\",\"NameID\":\"\",\"NameIDFormat\":\"\",\"SubjectID\":\"\",\"Groups\":null,\"UserName\":\"alice\",\"UserEmail\":\"\",\"UserCommonName\":\"\",\"UserSurname\":\"\",\"UserGivenName\":\"\",\"UserScopedAffiliation\":\"\",\"CustomAttributes\":null}\n",
 		w.Body.String()))
@@ -63,4 +63,27 @@ func TestSessionsCrud(t *testing.T) {
 	assert.Check(t, is.Equal("{\"sessions\":[]}\n",
 		w.Body.String()))
 
+	// user doesn't exists case
+	w = httptest.NewRecorder()
+	r, _ = http.NewRequest("POST", "https://idp.example.com/login",
+		strings.NewReader("user=unknown&password=dummypassword"))
+	r.Header.Set("Content-type", "application/x-www-form-urlencoded")
+	test.Server.ServeHTTP(w, r)
+	assert.Check(t, is.Equal(http.StatusOK, w.Code))
+	assert.Check(t, is.Equal("text/html; charset=utf-8",
+		w.Header().Get("Content-type")))
+	assert.Check(t, is.Equal(`<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Log in</title></head><body><p>Invalid username or password</p><form method="post" action="https://idp.example.com/login"><input type="text" name="user" placeholder="user" value="" /><input type="password" name="password" placeholder="password" value="" /><input type="hidden" name="SAMLRequest" value="" /><input type="hidden" name="RelayState" value="" /><input type="submit" value="Log In" /></form></body></html>`,
+		w.Body.String()))
+
+	// invalid username/password exists case
+	w = httptest.NewRecorder()
+	r, _ = http.NewRequest("POST", "https://idp.example.com/login",
+		strings.NewReader("user=alice&password=dummypassword"))
+	r.Header.Set("Content-type", "application/x-www-form-urlencoded")
+	test.Server.ServeHTTP(w, r)
+	assert.Check(t, is.Equal(http.StatusOK, w.Code))
+	assert.Check(t, is.Equal("text/html; charset=utf-8",
+		w.Header().Get("Content-type")))
+	assert.Check(t, is.Equal(`<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Log in</title></head><body><p>Invalid username or password</p><form method="post" action="https://idp.example.com/login"><input type="text" name="user" placeholder="user" value="" /><input type="password" name="password" placeholder="password" value="" /><input type="hidden" name="SAMLRequest" value="" /><input type="hidden" name="RelayState" value="" /><input type="submit" value="Log In" /></form></body></html>`,
+		w.Body.String()))
 }

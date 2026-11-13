@@ -6,8 +6,8 @@ import (
 	"testing"
 
 	"github.com/beevik/etree"
-	"gotest.tools/assert"
-	is "gotest.tools/assert/cmp"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestDataAES128(t *testing.T) {
@@ -57,16 +57,24 @@ func TestDataAES128(t *testing.T) {
 		RandReader = rand.New(rand.NewSource(0)) //nolint:gosec  // deterministic random numbers for tests
 		plaintext := "top secret message to use with gcm"
 
+		key := []byte("abcdefghijklmnop")
 		{
 			encrypter := AES128GCM
-			cipherEl, encErr := encrypter.Encrypt([]byte("abcdefghijklmnop"), []byte(plaintext), []byte("1234567890AZ"))
+			cipherEl, encErr := encrypter.Encrypt(key, []byte(plaintext), []byte("1234567890AZ"))
 			assert.Check(t, encErr)
 
-			doc := etree.NewDocument()
-			doc.SetRoot(cipherEl)
-			doc.IndentTabs()
-			_, err := doc.WriteToString()
+			actual, err := encrypter.Decrypt(key, cipherEl)
 			assert.Check(t, err)
+			assert.Check(t, is.DeepEqual([]byte(plaintext), actual))
+		}
+		{
+			encrypter := AES128GCM
+			cipherEl, encErr := encrypter.Encrypt(key, []byte(plaintext), nil)
+			assert.Check(t, encErr)
+
+			actual, err := encrypter.Decrypt(key, cipherEl)
+			assert.Check(t, err)
+			assert.Check(t, is.DeepEqual([]byte(plaintext), actual))
 		}
 	})
 }

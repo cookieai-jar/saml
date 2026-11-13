@@ -2,12 +2,20 @@ package samlsp
 
 import (
 	"bytes"
+	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -17,11 +25,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt/v4"
+	"github.com/golang-jwt/jwt/v5"
 	dsig "github.com/russellhaering/goxmldsig"
-	"gotest.tools/assert"
-	is "gotest.tools/assert/cmp"
-	"gotest.tools/golden"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/golden"
 
 	"github.com/crewjam/saml"
 	"github.com/crewjam/saml/testsaml"
@@ -55,7 +63,6 @@ func NewMiddlewareTest(t *testing.T) *MiddlewareTest {
 		rv, _ := time.Parse("Mon Jan 2 15:04:05.999999999 MST 2006", "Mon Dec 1 01:57:09.123456789 UTC 2015")
 		return rv
 	}
-	jwt.TimeFunc = saml.TimeNow
 	saml.Clock = dsig.NewFakeClockAt(saml.TimeNow())
 	saml.RandReader = &testRandomReader{}
 
@@ -150,7 +157,7 @@ func TestMiddlewareRequireAccountNoCreds(t *testing.T) {
 	test.Middleware.ServiceProvider.AcsURL.Scheme = "http"
 
 	handler := test.Middleware.RequireAccount(
-		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 			panic("not reached")
 		}))
 
@@ -160,7 +167,7 @@ func TestMiddlewareRequireAccountNoCreds(t *testing.T) {
 
 	assert.Check(t, is.Equal(http.StatusFound, resp.Code))
 	assert.Check(t, is.Equal("saml_KCosLjAyNDY4Ojw-QEJERkhKTE5QUlRWWFpcXmBiZGZoamxucHJ0dnh6="+
-		test.makeTrackedRequest("id-00020406080a0c0e10121416181a1c1e20222426")+"; Path=/saml2/acs; Max-Age=90; HttpOnly",
+		test.makeTrackedRequest("id-00020406080a0c0e10121416181a1c1e20222426")+"; Path=/saml2/acs; Max-Age=600; HttpOnly",
 		resp.Header().Get("Set-Cookie")))
 
 	redirectURL, err := url.Parse(resp.Header().Get("Location"))
@@ -174,7 +181,7 @@ func TestMiddlewareRequireAccountNoCredsSecure(t *testing.T) {
 	test := NewMiddlewareTest(t)
 
 	handler := test.Middleware.RequireAccount(
-		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 			panic("not reached")
 		}))
 
@@ -183,7 +190,7 @@ func TestMiddlewareRequireAccountNoCredsSecure(t *testing.T) {
 	handler.ServeHTTP(resp, req)
 
 	assert.Check(t, is.Equal(http.StatusFound, resp.Code))
-	assert.Check(t, is.Equal("saml_KCosLjAyNDY4Ojw-QEJERkhKTE5QUlRWWFpcXmBiZGZoamxucHJ0dnh6="+test.makeTrackedRequest("id-00020406080a0c0e10121416181a1c1e20222426")+"; Path=/saml2/acs; Max-Age=90; HttpOnly; Secure",
+	assert.Check(t, is.Equal("saml_KCosLjAyNDY4Ojw-QEJERkhKTE5QUlRWWFpcXmBiZGZoamxucHJ0dnh6="+test.makeTrackedRequest("id-00020406080a0c0e10121416181a1c1e20222426")+"; Path=/saml2/acs; Max-Age=600; HttpOnly; Secure; SameSite=None",
 		resp.Header().Get("Set-Cookie")))
 
 	redirectURL, err := url.Parse(resp.Header().Get("Location"))
@@ -200,7 +207,7 @@ func TestMiddlewareRequireAccountNoCredsPostBinding(t *testing.T) {
 		test.Middleware.ServiceProvider.GetSSOBindingLocation(saml.HTTPRedirectBinding)))
 
 	handler := test.Middleware.RequireAccount(
-		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 			panic("not reached")
 		}))
 
@@ -209,7 +216,7 @@ func TestMiddlewareRequireAccountNoCredsPostBinding(t *testing.T) {
 	handler.ServeHTTP(resp, req)
 
 	assert.Check(t, is.Equal(http.StatusOK, resp.Code))
-	assert.Check(t, is.Equal("saml_KCosLjAyNDY4Ojw-QEJERkhKTE5QUlRWWFpcXmBiZGZoamxucHJ0dnh6="+test.makeTrackedRequest("id-00020406080a0c0e10121416181a1c1e20222426")+"; Path=/saml2/acs; Max-Age=90; HttpOnly; Secure",
+	assert.Check(t, is.Equal("saml_KCosLjAyNDY4Ojw-QEJERkhKTE5QUlRWWFpcXmBiZGZoamxucHJ0dnh6="+test.makeTrackedRequest("id-00020406080a0c0e10121416181a1c1e20222426")+"; Path=/saml2/acs; Max-Age=600; HttpOnly; Secure; SameSite=None",
 		resp.Header().Get("Set-Cookie")))
 
 	golden.Assert(t, resp.Body.String(), "expected_post_binding_response.html")
@@ -224,6 +231,40 @@ func TestMiddlewareRequireAccountNoCredsPostBinding(t *testing.T) {
 	assert.Check(t, is.Equal("text/html", resp.Header().Get("Content-type")))
 }
 
+func TestMiddlewareRequireAccountNoCredsPostBindingScriptNonce(t *testing.T) {
+	test := NewMiddlewareTest(t)
+	test.Middleware.ServiceProvider.IDPMetadata.IDPSSODescriptors[0].SingleSignOnServices = test.Middleware.ServiceProvider.IDPMetadata.IDPSSODescriptors[0].SingleSignOnServices[1:2]
+
+	type nonceKey struct{}
+	test.Middleware.ScriptNonce = func(r *http.Request) string {
+		nonce, _ := r.Context().Value(nonceKey{}).(string)
+		return nonce
+	}
+
+	handler := test.Middleware.RequireAccount(
+		http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+			panic("not reached")
+		}))
+
+	req, _ := http.NewRequest("GET", "/frob", nil)
+	req = req.WithContext(context.WithValue(req.Context(), nonceKey{}, "n0nce"))
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	assert.Check(t, is.Equal(http.StatusOK, resp.Code))
+	// the body is the usual form, with the nonce on its <script> element
+	expected := strings.Replace(string(golden.Get(t, "expected_post_binding_response.html")),
+		"<script>", `<script nonce="n0nce">`, 1)
+	assert.Check(t, is.Equal(expected, resp.Body.String()))
+
+	// the script content, and so the CSP hash, is unchanged
+	scriptContent := "document.getElementById('SAMLSubmitButton').style.visibility=\"hidden\";document.getElementById('SAMLRequestForm').submit();"
+	scriptSum := sha256.Sum256([]byte(scriptContent))
+	scriptHash := base64.StdEncoding.EncodeToString(scriptSum[:])
+	assert.Check(t, is.Equal("default-src; script-src 'sha256-"+scriptHash+"'; reflected-xss block; referrer no-referrer;",
+		resp.Header().Get("Content-Security-Policy")))
+}
+
 func TestMiddlewareRequireAccountCreds(t *testing.T) {
 	test := NewMiddlewareTest(t)
 	handler := test.Middleware.RequireAccount(
@@ -233,7 +274,7 @@ func TestMiddlewareRequireAccountCreds(t *testing.T) {
 			assert.Check(t, is.Equal("555-5555", jwtSession.Attributes.Get("telephoneNumber")))
 			assert.Check(t, is.Equal("And I", jwtSession.Attributes.Get("sn")))
 			assert.Check(t, is.Equal("urn:mace:dir:entitlement:common-lib-terms", jwtSession.Attributes.Get("eduPersonEntitlement")))
-			assert.Check(t, is.Equal("", jwtSession.Attributes.Get("eduPersonTargetedID")))
+			assert.Check(t, is.Equal("8F+M9ovyaYNwCId0pVkVsnZYRDo=", jwtSession.Attributes.Get("eduPersonTargetedID")))
 			assert.Check(t, is.Equal("Me Myself", jwtSession.Attributes.Get("givenName")))
 			assert.Check(t, is.Equal("Me Myself And I", jwtSession.Attributes.Get("cn")))
 			assert.Check(t, is.Equal("myself", jwtSession.Attributes.Get("uid")))
@@ -256,7 +297,7 @@ func TestMiddlewareRequireAccountCreds(t *testing.T) {
 func TestMiddlewareRequireAccountBadCreds(t *testing.T) {
 	test := NewMiddlewareTest(t)
 	handler := test.Middleware.RequireAccount(
-		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 			panic("not reached")
 		}))
 
@@ -269,7 +310,7 @@ func TestMiddlewareRequireAccountBadCreds(t *testing.T) {
 
 	assert.Check(t, is.Equal(http.StatusFound, resp.Code))
 
-	assert.Check(t, is.Equal("saml_KCosLjAyNDY4Ojw-QEJERkhKTE5QUlRWWFpcXmBiZGZoamxucHJ0dnh6="+test.makeTrackedRequest("id-00020406080a0c0e10121416181a1c1e20222426")+"; Path=/saml2/acs; Max-Age=90; HttpOnly; Secure",
+	assert.Check(t, is.Equal("saml_KCosLjAyNDY4Ojw-QEJERkhKTE5QUlRWWFpcXmBiZGZoamxucHJ0dnh6="+test.makeTrackedRequest("id-00020406080a0c0e10121416181a1c1e20222426")+"; Path=/saml2/acs; Max-Age=600; HttpOnly; Secure; SameSite=None",
 		resp.Header().Get("Set-Cookie")))
 
 	redirectURL, err := url.Parse(resp.Header().Get("Location"))
@@ -281,13 +322,13 @@ func TestMiddlewareRequireAccountBadCreds(t *testing.T) {
 
 func TestMiddlewareRequireAccountExpiredCreds(t *testing.T) {
 	test := NewMiddlewareTest(t)
-	jwt.TimeFunc = func() time.Time {
+	saml.TimeNow = func() time.Time {
 		rv, _ := time.Parse("Mon Jan 2 15:04:05 UTC 2006", "Mon Dec 1 01:31:21 UTC 2115")
 		return rv
 	}
 
 	handler := test.Middleware.RequireAccount(
-		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 			panic("not reached")
 		}))
 
@@ -299,20 +340,20 @@ func TestMiddlewareRequireAccountExpiredCreds(t *testing.T) {
 	handler.ServeHTTP(resp, req)
 
 	assert.Check(t, is.Equal(http.StatusFound, resp.Code))
-	assert.Check(t, is.Equal("saml_KCosLjAyNDY4Ojw-QEJERkhKTE5QUlRWWFpcXmBiZGZoamxucHJ0dnh6="+test.makeTrackedRequest("id-00020406080a0c0e10121416181a1c1e20222426")+"; Path=/saml2/acs; Max-Age=90; HttpOnly; Secure",
+	assert.Check(t, is.Equal("saml_KCosLjAyNDY4Ojw-QEJERkhKTE5QUlRWWFpcXmBiZGZoamxucHJ0dnh6="+test.makeTrackedRequest("id-00020406080a0c0e10121416181a1c1e20222426")+"; Path=/saml2/acs; Max-Age=600; HttpOnly; Secure; SameSite=None",
 		resp.Header().Get("Set-Cookie")))
 
 	redirectURL, err := url.Parse(resp.Header().Get("Location"))
 	assert.Check(t, err)
 	decodedRequest, err := testsaml.ParseRedirectRequest(redirectURL)
 	assert.Check(t, err)
-	golden.Assert(t, string(decodedRequest), "expected_authn_request_secure.xml")
+	golden.Assert(t, strings.Replace(string(decodedRequest), `IssueInstant="2115-12-01T01:31:21Z"`, `IssueInstant="2015-12-01T01:57:09.123Z"`, 1), "expected_authn_request_secure.xml")
 }
 
 func TestMiddlewareRequireAccountPanicOnRequestToACS(t *testing.T) {
 	test := NewMiddlewareTest(t)
 	handler := test.Middleware.RequireAccount(
-		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 			panic("not reached")
 		}))
 
@@ -326,7 +367,7 @@ func TestMiddlewareRequireAttribute(t *testing.T) {
 	test := NewMiddlewareTest(t)
 	handler := test.Middleware.RequireAccount(
 		RequireAttribute("eduPersonAffiliation", "Staff")(
-			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusTeapot)
 			})))
 
@@ -344,7 +385,7 @@ func TestMiddlewareRequireAttributeWrongValue(t *testing.T) {
 	test := NewMiddlewareTest(t)
 	handler := test.Middleware.RequireAccount(
 		RequireAttribute("eduPersonAffiliation", "DomainAdmins")(
-			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 				panic("not reached")
 			})))
 
@@ -362,7 +403,7 @@ func TestMiddlewareRequireAttributeNotPresent(t *testing.T) {
 	test := NewMiddlewareTest(t)
 	handler := test.Middleware.RequireAccount(
 		RequireAttribute("valueThatDoesntExist", "doesntMatter")(
-			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 				panic("not reached")
 			})))
 
@@ -379,7 +420,7 @@ func TestMiddlewareRequireAttributeNotPresent(t *testing.T) {
 func TestMiddlewareRequireAttributeMissingAccount(t *testing.T) {
 	test := NewMiddlewareTest(t)
 	handler := RequireAttribute("eduPersonAffiliation", "DomainAdmins")(
-		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 			panic("not reached")
 		}))
 
@@ -409,9 +450,12 @@ func TestMiddlewareCanParseResponse(t *testing.T) {
 
 	assert.Check(t, is.Equal("/frob", resp.Header().Get("Location")))
 	assert.Check(t, is.DeepEqual([]string{
-		"saml_KCosLjAyNDY4Ojw-QEJERkhKTE5QUlRWWFpcXmBiZGZoamxucHJ0dnh6=; Domain=15661444.ngrok.io; Expires=Thu, 01 Jan 1970 00:00:01 GMT",
+		"saml_KCosLjAyNDY4Ojw-QEJERkhKTE5QUlRWWFpcXmBiZGZoamxucHJ0dnh6=; Path=/saml2/acs; Expires=Thu, 01 Jan 1970 00:00:01 GMT; Secure; SameSite=None",
+		// the domain-scoped session cookie set by earlier versions is expired
+		"ttt=; Path=/; Domain=15661444.ngrok.io; Expires=Thu, 01 Jan 1970 00:00:01 GMT; HttpOnly; Secure",
 		"ttt=" + test.expectedSessionCookie + "; " +
-			"Path=/; Domain=15661444.ngrok.io; Max-Age=7200; HttpOnly; Secure"},
+			"Path=/; Max-Age=7200; HttpOnly; Secure",
+	},
 		resp.Header()["Set-Cookie"]))
 }
 
@@ -428,14 +472,17 @@ func TestMiddlewareDefaultCookieDomainIPv4(t *testing.T) {
 	resp := httptest.NewRecorder()
 	assert.Check(t, sp.CreateSession(resp, req, &saml.Assertion{}))
 
-	assert.Check(t,
-		strings.Contains(resp.Header().Get("Set-Cookie"), "Domain=127.0.0.1;"),
-		"Cookie domain must not contain a port or the cookie cannot be set properly: %v", resp.Header().Get("Set-Cookie"))
+	cookies := resp.Result().Cookies()
+	assert.Assert(t, is.Len(cookies, 2))
+	// the legacy cookie domain must not contain a port or it cannot be expired
+	assert.Check(t, is.Equal("127.0.0.1", cookies[0].Domain))
+	assert.Check(t, is.Equal("", cookies[0].Value))
+	// the session cookie is host-only
+	assert.Check(t, is.Equal("", cookies[1].Domain))
+	assert.Check(t, cookies[1].Value != "")
 }
 
 func TestMiddlewareDefaultCookieDomainIPv6(t *testing.T) {
-	t.Skip("fails") // TODO(ross): fix this test
-
 	test := NewMiddlewareTest(t)
 
 	sp := DefaultSessionProvider(Options{
@@ -447,15 +494,18 @@ func TestMiddlewareDefaultCookieDomainIPv6(t *testing.T) {
 	resp := httptest.NewRecorder()
 	assert.Check(t, sp.CreateSession(resp, req, &saml.Assertion{}))
 
+	// net/http never accepted an IPv6 address as a cookie domain, so there is
+	// no legacy cookie to expire and the session cookie is host-only.
+	assert.Check(t, is.Len(resp.Header()["Set-Cookie"], 1))
 	assert.Check(t,
-		strings.Contains(resp.Header().Get("Set-Cookie"), "Domain=::1;"),
-		"Cookie domain must not contain a port or the cookie cannot be set properly: %v", resp.Header().Get("Set-Cookie"))
+		!strings.Contains(resp.Header().Get("Set-Cookie"), "Domain="),
+		"Cookie must be host-only: %v", resp.Header().Get("Set-Cookie"))
 }
 
 func TestMiddlewareRejectsInvalidRelayState(t *testing.T) {
 	test := NewMiddlewareTest(t)
 
-	test.Middleware.OnError = func(w http.ResponseWriter, r *http.Request, err error) {
+	test.Middleware.OnError = func(w http.ResponseWriter, _ *http.Request, err error) {
 		assert.Check(t, is.Error(err, http.ErrNoCookie.Error()))
 		http.Error(w, "forbidden", http.StatusTeapot)
 	}
@@ -478,7 +528,7 @@ func TestMiddlewareRejectsInvalidRelayState(t *testing.T) {
 func TestMiddlewareRejectsInvalidCookie(t *testing.T) {
 	test := NewMiddlewareTest(t)
 
-	test.Middleware.OnError = func(w http.ResponseWriter, r *http.Request, err error) {
+	test.Middleware.OnError = func(w http.ResponseWriter, _ *http.Request, err error) {
 		assert.Check(t, is.Error(err, "Authentication failed"))
 		http.Error(w, "forbidden", http.StatusTeapot)
 	}
@@ -520,4 +570,412 @@ func TestMiddlewareHandlesInvalidResponse(t *testing.T) {
 	assert.Check(t, is.Equal("Forbidden\n", string(respBody)))
 	assert.Check(t, is.Equal("", resp.Header().Get("Location")))
 	assert.Check(t, is.Equal("", resp.Header().Get("Set-Cookie")))
+}
+
+// stubSessionProvider is a SessionProvider whose GetSession returns fixed values.
+type stubSessionProvider struct {
+	CookieSessionProvider
+	session Session
+	err     error
+}
+
+func (s stubSessionProvider) GetSession(_ *http.Request) (Session, error) {
+	return s.session, s.err
+}
+
+func TestMiddlewareRequireAccountSessionAndError(t *testing.T) {
+	test := NewMiddlewareTest(t)
+	providerErr := errors.New("session signature invalid")
+	test.Middleware.Session = stubSessionProvider{
+		session: JWTSessionClaims{},
+		err:     providerErr,
+	}
+	var onErrorErr error
+	test.Middleware.OnError = func(w http.ResponseWriter, _ *http.Request, err error) {
+		onErrorErr = err
+		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+	}
+	handler := test.Middleware.RequireAccount(
+		http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+			panic("not reached")
+		}))
+
+	req, _ := http.NewRequest("GET", "/frob", nil)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	assert.Check(t, is.Equal(http.StatusForbidden, resp.Code))
+	assert.Check(t, is.Equal(providerErr, onErrorErr))
+}
+
+func TestMiddlewareRequireAccountWrappedErrNoSession(t *testing.T) {
+	test := NewMiddlewareTest(t)
+	test.Middleware.Session = stubSessionProvider{
+		err: fmt.Errorf("custom provider: %w", ErrNoSession),
+	}
+	test.Middleware.OnError = func(_ http.ResponseWriter, _ *http.Request, err error) {
+		t.Fatalf("OnError called unexpectedly: %v", err)
+	}
+	handler := test.Middleware.RequireAccount(
+		http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+			panic("not reached")
+		}))
+
+	req, _ := http.NewRequest("GET", "/frob", nil)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	assert.Check(t, is.Equal(http.StatusFound, resp.Code))
+	redirectURL, err := url.Parse(resp.Header().Get("Location"))
+	assert.Check(t, err)
+	_, err = testsaml.ParseRedirectRequest(redirectURL)
+	assert.Check(t, err)
+}
+
+func TestMiddlewareRequireAccountNilSessionNilError(t *testing.T) {
+	test := NewMiddlewareTest(t)
+	test.Middleware.Session = stubSessionProvider{}
+	var onErrorErr error
+	test.Middleware.OnError = func(w http.ResponseWriter, _ *http.Request, err error) {
+		onErrorErr = err
+		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+	}
+	handler := test.Middleware.RequireAccount(
+		http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+			panic("not reached")
+		}))
+
+	req, _ := http.NewRequest("GET", "/frob", nil)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	assert.Check(t, is.Equal(http.StatusForbidden, resp.Code))
+	assert.Check(t, onErrorErr != nil)
+}
+
+type mockSigner struct {
+	signer crypto.Signer
+}
+
+func (m *mockSigner) Public() crypto.PublicKey {
+	return m.signer.Public()
+}
+
+func (m *mockSigner) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
+	return m.signer.Sign(rand, digest, opts)
+}
+
+func newMockRSASigner(t *testing.T) crypto.Signer {
+	key := mustParsePrivateKey(golden.Get(t, "key.pem"))
+	return &mockSigner{signer: key.(crypto.Signer)}
+}
+
+func TestMiddleware_WithCryptoSignerE2E(t *testing.T) {
+	origTimeNow := saml.TimeNow
+	origClock := saml.Clock
+	origRandReader := saml.RandReader
+	t.Cleanup(func() {
+		saml.TimeNow = origTimeNow
+		saml.Clock = origClock
+		saml.RandReader = origRandReader
+	})
+
+	saml.TimeNow = func() time.Time {
+		rv, _ := time.Parse("Mon Jan 2 15:04:05.999999999 MST 2006", "Mon Dec 1 01:57:09.123456789 UTC 2015")
+		return rv
+	}
+	saml.Clock = dsig.NewFakeClockAt(saml.TimeNow())
+	saml.RandReader = &testRandomReader{}
+
+	cert := mustParseCertificate(golden.Get(t, "cert.pem"))
+	idpMetadata := golden.Get(t, "idp_metadata.xml")
+
+	var metadata saml.EntityDescriptor
+	if err := xml.Unmarshal(idpMetadata, &metadata); err != nil {
+		panic(err)
+	}
+
+	mockSigner := newMockRSASigner(t)
+
+	opts := Options{
+		URL:         mustParseURL("https://15661444.ngrok.io/"),
+		Key:         mockSigner,
+		Certificate: cert,
+		IDPMetadata: &metadata,
+	}
+
+	middleware, err := New(opts)
+	assert.Check(t, err)
+
+	sessionProvider := DefaultSessionProvider(opts)
+	sessionProvider.Name = "ttt"
+	sessionProvider.MaxAge = 7200 * time.Second
+
+	sessionCodec := sessionProvider.Codec.(JWTSessionCodec)
+	sessionCodec.MaxAge = 7200 * time.Second
+	sessionProvider.Codec = sessionCodec
+
+	middleware.Session = sessionProvider
+	middleware.ServiceProvider.MetadataURL.Path = "/saml2/metadata"
+	middleware.ServiceProvider.AcsURL.Path = "/saml2/acs"
+	middleware.ServiceProvider.SloURL.Path = "/saml2/slo"
+
+	t.Run("SessionEncodeDecode", func(t *testing.T) {
+		var tc JWTSessionClaims
+		if err := json.Unmarshal(golden.Get(t, "token.json"), &tc); err != nil {
+			t.Fatal(err)
+		}
+
+		encoded, err := sessionProvider.Codec.Encode(tc)
+		assert.Check(t, err)
+		assert.Assert(t, encoded != "")
+
+		decoded, err := sessionProvider.Codec.Decode(encoded)
+		assert.Check(t, err)
+		decodedClaims := decoded.(JWTSessionClaims)
+		assert.Equal(t, tc.Subject, decodedClaims.Subject)
+	})
+
+	t.Run("TrackedRequestEncodeDecode", func(t *testing.T) {
+		codec := middleware.RequestTracker.(CookieRequestTracker).Codec
+		trackedReq := TrackedRequest{
+			Index:         "test-index",
+			SAMLRequestID: "test-request-id",
+			URI:           "/test-uri",
+		}
+
+		encoded, err := codec.Encode(trackedReq)
+		assert.Check(t, err)
+		assert.Assert(t, encoded != "")
+
+		decoded, err := codec.Decode(encoded)
+		assert.Check(t, err)
+		assert.Equal(t, trackedReq.Index, decoded.Index)
+		assert.Equal(t, trackedReq.SAMLRequestID, decoded.SAMLRequestID)
+	})
+
+	t.Run("RequireAccountFlow", func(t *testing.T) {
+		handler := middleware.RequireAccount(
+			http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+				panic("not reached")
+			}))
+
+		req, _ := http.NewRequest("GET", "/protected", nil)
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+
+		assert.Check(t, is.Equal(http.StatusFound, resp.Code))
+		assert.Assert(t, resp.Header().Get("Location") != "")
+		assert.Assert(t, resp.Header().Get("Set-Cookie") != "")
+	})
+
+	t.Run("Metadata", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", "/saml2/metadata", nil)
+		resp := httptest.NewRecorder()
+		middleware.ServeHTTP(resp, req)
+
+		assert.Check(t, is.Equal(http.StatusOK, resp.Code))
+		assert.Check(t, is.Equal("application/samlmetadata+xml",
+			resp.Header().Get("Content-type")))
+		golden.Assert(t, resp.Body.String(), "expected_middleware_metadata.xml")
+	})
+}
+
+func TestJWTSessionCodec_CryptoSignerEncodeDecode(t *testing.T) {
+	tests := []struct {
+		name    string
+		method  jwt.SigningMethod
+		genKey  func(t *testing.T) crypto.Signer
+		subject string
+	}{
+		{
+			name:   "ECDSA-P256",
+			method: jwt.SigningMethodES256,
+			genKey: func(t *testing.T) crypto.Signer {
+				k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+				assert.Check(t, err)
+				return k
+			},
+			subject: "test-ecdsa-p256",
+		},
+		{
+			name:   "ECDSA-P384",
+			method: jwt.SigningMethodES384,
+			genKey: func(t *testing.T) crypto.Signer {
+				k, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+				assert.Check(t, err)
+				return k
+			},
+			subject: "test-ecdsa-p384",
+		},
+		{
+			name:   "ECDSA-P521",
+			method: jwt.SigningMethodES512,
+			genKey: func(t *testing.T) crypto.Signer {
+				k, err := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
+				assert.Check(t, err)
+				return k
+			},
+			subject: "test-ecdsa-p521",
+		},
+		{
+			name:   "RSA-PSS",
+			method: jwt.SigningMethodPS256,
+			genKey: func(t *testing.T) crypto.Signer {
+				k, err := rsa.GenerateKey(rand.Reader, 2048)
+				assert.Check(t, err)
+				return k
+			},
+			subject: "test-rsa-pss",
+		},
+		{
+			name:   "EdDSA",
+			method: jwt.SigningMethodEdDSA,
+			genKey: func(t *testing.T) crypto.Signer {
+				_, k, err := ed25519.GenerateKey(rand.Reader)
+				assert.Check(t, err)
+				return k
+			},
+			subject: "test-eddsa",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Now()
+			origTimeNow := saml.TimeNow
+			t.Cleanup(func() { saml.TimeNow = origTimeNow })
+			saml.TimeNow = func() time.Time { return now }
+
+			signer := &mockSigner{signer: tt.genKey(t)}
+
+			audience := "https://example.com/"
+			codec := JWTSessionCodec{
+				SigningMethod: tt.method,
+				Audience:      audience,
+				Issuer:        audience,
+				MaxAge:        time.Hour,
+				Key:           signer,
+			}
+
+			tc := JWTSessionClaims{
+				RegisteredClaims: jwt.RegisteredClaims{
+					Audience:  jwt.ClaimStrings{audience},
+					Issuer:    audience,
+					Subject:   tt.subject,
+					IssuedAt:  jwt.NewNumericDate(now),
+					ExpiresAt: jwt.NewNumericDate(now.Add(time.Hour)),
+					NotBefore: jwt.NewNumericDate(now),
+				},
+				SAMLSession: true,
+			}
+
+			encoded, err := codec.Encode(tc)
+			assert.Check(t, err)
+			assert.Assert(t, encoded != "")
+
+			decoded, err := codec.Decode(encoded)
+			assert.Check(t, err)
+			decodedClaims := decoded.(JWTSessionClaims)
+			assert.Equal(t, tt.subject, decodedClaims.Subject)
+		})
+	}
+}
+
+func TestJWTSessionCodec_UnsupportedAlgorithmReturnsError(t *testing.T) {
+	now := time.Now()
+	origTimeNow := saml.TimeNow
+	t.Cleanup(func() { saml.TimeNow = origTimeNow })
+	saml.TimeNow = func() time.Time { return now }
+
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	assert.Check(t, err)
+
+	signer := &mockSigner{signer: rsaKey}
+
+	audience := "https://example.com/"
+	codec := JWTSessionCodec{
+		SigningMethod: jwt.SigningMethodNone,
+		Audience:      audience,
+		Issuer:        audience,
+		MaxAge:        time.Hour,
+		Key:           signer,
+	}
+
+	tc := JWTSessionClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Audience:  jwt.ClaimStrings{audience},
+			Issuer:    audience,
+			Subject:   "test",
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(time.Hour)),
+			NotBefore: jwt.NewNumericDate(now),
+		},
+		SAMLSession: true,
+	}
+
+	_, err = codec.Encode(tc)
+	assert.Check(t, is.ErrorContains(err, "unsupported algorithm for crypto.Signer"))
+}
+
+func TestIsLocalRedirect(t *testing.T) {
+	for _, tc := range []struct {
+		uri  string
+		want bool
+	}{
+		{"/", true},
+		{"/foo", true},
+		{"/foo/bar", true},
+		{"/foo?bar=baz", true},
+		{"/foo#fragment", true},
+		{"/foo?next=//elsewhere", true},
+		{"", false},
+		{"foo", false},
+		{" /foo", false},
+		{"//evil.example", false},
+		{"//evil.example/path", false},
+		{"https://evil.example", false},
+		{"http://evil.example", false},
+		{"javascript:alert(1)", false},
+		{"data:text/html,<script>", false},
+		{"mailto:a@evil.example", false},
+		{"/\\evil.example", false},
+		{"/foo\\bar", false},
+		{"/\t/evil.example", false},
+		{"/\n/evil.example", false},
+		{"/\r/evil.example", false},
+		{"/\x00/evil.example", false},
+		{"/\x7f/evil.example", false},
+		{"/%zz", false},
+	} {
+		assert.Check(t, is.Equal(tc.want, isLocalRedirect(tc.uri)), "isLocalRedirect(%q)", tc.uri)
+	}
+}
+
+// With AllowIDPInitiated and no tracked request, the middleware follows
+// RelayState only when it is a path on this site.
+func TestMiddlewareIDPInitiatedRelayStateRedirect(t *testing.T) {
+	for relayState, want := range map[string]string{
+		"/landing":              "/landing",
+		"https://evil.example/": "/default",
+		"//evil.example/":       "/default",
+		"/\\evil.example/":      "/default",
+		"/\t/evil.example/":     "/default",
+		"javascript:alert(1)":   "/default",
+	} {
+		t.Run(relayState, func(t *testing.T) {
+			test := NewMiddlewareTest(t)
+			test.Middleware.ServiceProvider.AllowIDPInitiated = true
+
+			form := url.Values{"RelayState": {relayState}}
+			req := httptest.NewRequest(http.MethodPost, "/saml2/acs", strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			assert.NilError(t, req.ParseForm())
+
+			rec := httptest.NewRecorder()
+			test.Middleware.CreateSessionFromAssertion(rec, req, &saml.Assertion{}, "/default")
+			assert.Check(t, is.Equal(http.StatusFound, rec.Code))
+			assert.Check(t, is.Equal(want, rec.Header().Get("Location")))
+		})
+	}
 }
